@@ -27,6 +27,16 @@ def get_field_indices(header):
     return indices
 
 
+def read_dense_matrix(path, header_is_present=True):
+    with open(path) as f:
+        if header_is_present:
+            _ = next(f)
+        tensors = list()
+        for line in f:
+            tensors.append(torch.tensor([float(x) for x in line.split()]))
+    return torch.vstack(tensors)
+
+
 def read_sparse_matrix(paths):
     list_of_sparse_tensors = list()
     for path in paths:

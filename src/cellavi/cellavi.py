@@ -7,23 +7,27 @@ import pyro.distributions as dist
 import torch
 import torch.nn.functional as F
 from misc_cellavi import (
-    read_info,
+    read_dense_matrix,
+    read_info_from_file,
 )
 from pyro.infer.autoguide import (
     AutoNormal,
 )
 
-global K  # Number of units / set by user.
+global K  # Number of moduls / set by user.
 global B  # Number of batches / from data.
 global C  # Number of types / from data.
 global R  # Number of groups / from data.
 global G  # Number of genes / from data.
 
 
-DEBUG = False
+DEBUG = True
 SUBSMPL = 512
 NUM_PARTICLES = 12
-NUM_EPOCHS = 16
+MIN_CELL_UPDATES = 16
+MIN_TOT_UPDATES = 2048
+
+DEBUG_COUNTER = 0
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
@@ -112,11 +116,12 @@ class Cellavi(pyro.nn.PyroModule):
 
         # Unpack data.
         self.ctype, self.batch, self.group, self.label, self.X, masks = data
-        self.cmask, self.lmask, self.gmask = masks
+        self.cmask, self.mmask = masks
+        self.gmask = self.X.isnan()
 
         self.ctype = F.one_hot(self.ctype.view(-1, 1), num_classes=C).float()
         self.cmask = self.cmask.view(-1, 1)
-        self.lmask = self.lmask.view(-1, 1)
+        self.mmask = self.mmask.view(-1, 1)
 
         self.device = self.X.device
         self.ncells = int(self.X.shape[0])
@@ -132,26 +137,10 @@ class Cellavi(pyro.nn.PyroModule):
         self.marginalize = marginalize
 
         # 1a) Define core parts of the model.
-        self.output_scale_tril_unit = self.sample_scale_tril_unit
         self.output_scale_factor = self.sample_scale_factor
-        self.output_log_fuzz_loc = self.sample_log_fuzz_loc
-        self.output_log_fuzz_scale = self.sample_log_fuzz_scale
-        self.output_global_base = self.sample_global_base
         self.output_gene_fuzz = self.sample_gene_fuzz
-        self.output_base = self.sample_base
 
         # 1b) Define optional parts of the model.
-        if K > 1:
-            self.need_to_infer_units = True
-            self.output_units = self.sample_units
-            self.output_theta_i = self.sample_theta_i
-            self.collect_units_i = self.compute_units_i
-        else:
-            self.need_to_infer_units = False
-            self.output_units = self.zero
-            self.output_theta_i = self.zero
-            self.collect_units_i = self.zero
-
         if B > 1:
             self.need_to_infer_batch_fx = True
             self.output_batch_fx_scale = self.sample_batch_fx_scale
@@ -162,6 +151,28 @@ class Cellavi(pyro.nn.PyroModule):
             self.output_batch_fx_scale = self.zero
             self.output_batch_fx = self.zero
             self.collect_batch_fx_i = self.zero
+
+        if C > 1:
+            self.output_global_base = self.sample_global_base
+            self.output_scale_tril_unit = self.sample_scale_tril_unit
+            self.output_base = self.sample_base
+        else:
+            self.output_global_base = self.zero
+            self.output_scale_tril_unit = self.one
+            self.output_base = self.sample_base_0
+
+        if K > 1:
+            self.need_to_infer_moduls = True
+            self.output_moduls = self.sample_moduls
+            self.output_scale_moduls = self.sample_scale_moduls
+            self.output_theta_i = self.sample_theta_i
+            self.collect_moduls_i = self.compute_moduls_i
+        else:
+            self.need_to_infer_moduls = False
+            self.output_scale_moduls = self.zero
+            self.output_moduls = self.zero
+            self.output_theta_i = self.zero
+            self.collect_moduls_i = self.zero
 
         if cmask.all():
             self.need_to_infer_cell_type = False
@@ -180,15 +191,15 @@ class Cellavi(pyro.nn.PyroModule):
         # 3) Define the guide parameters.
         if self.need_to_infer_cell_type:
             self.c_indx_probs = pyro.nn.module.PyroParam(
-                torch.ones(self.ncells, 1, C).to(self.device),
+                0.1 * torch.ones(self.ncells, 1, C).to(self.device),
                 constraint=torch.distributions.constraints.simplex,
                 event_dim=1,
             )
 
-        if self.need_to_infer_units:
+        if self.need_to_infer_moduls:
             self.log_theta_i_loc = pyro.nn.module.PyroParam(torch.zeros(self.ncells, 1, K).to(self.device), event_dim=1)
             self.log_theta_i_scale = pyro.nn.module.PyroParam(
-                torch.ones(self.ncells, 1, K).to(self.device),
+                0.1 * torch.ones(self.ncells, 1, K).to(self.device),
                 constraint=torch.distributions.constraints.positive,
                 event_dim=1,
             )
@@ -196,16 +207,27 @@ class Cellavi(pyro.nn.PyroModule):
         if self.marginalize is False:
             self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(self.ncells, G).to(self.device), event_dim=0)
             self.z_i_scale = pyro.nn.module.PyroParam(
-                torch.ones(self.ncells, G).to(self.device),
+                0.5 * torch.ones(self.ncells, G).to(self.device),
                 constraint=torch.distributions.constraints.positive,
                 event_dim=0,
             )
 
     #  == Helper functions == #
+    def one(self, *args, **kwargs):
+        return 1.0
+
     def zero(self, *args, **kwargs):
         return 0.0
 
     #  ==  Model parts == #
+    def sample_scale_moduls(self):
+        scale_moduls = pyro.sample(
+            name="scale_moduls",
+            # dim(scale_tril_unit): (P x 1) x 1
+            fn=dist.LogNormal(loc=-1.0 * torch.ones(1).to(self.device), scale=0.5 * torch.ones(1).to(self.device)),
+        )
+        return scale_moduls
+
     def sample_scale_tril_unit(self):
         scale_tril_unit = pyro.sample(
             name="scale_tril_unit",
@@ -236,24 +258,6 @@ class Cellavi(pyro.nn.PyroModule):
         )
         return batch_fx_scale
 
-    def sample_log_fuzz_loc(self):
-        log_fuzz_loc = pyro.sample(
-            name="log_fuzz_loc",
-            # dim(log_fuzz_loc): (P) x 1 x 1
-            fn=dist.Normal(-1.0 * torch.ones(1, 1).to(self.device), 0.5 * torch.ones(1, 1).to(self.device)),
-        )
-        return log_fuzz_loc
-
-    def sample_log_fuzz_scale(self):
-        log_fuzz_scale = pyro.sample(
-            name="log_fuzz_scale",
-            # dim(log_fuzz_scale): (P) x 1 x 1
-            fn=dist.Exponential(
-                3.0 * torch.ones(1, 1).to(self.device),
-            ),
-        )
-        return log_fuzz_scale
-
     def sample_global_base(self):
         global_base = pyro.sample(
             name="global_base",
@@ -266,21 +270,27 @@ class Cellavi(pyro.nn.PyroModule):
         )
         return global_base
 
-    def sample_base(self, loc, scale_tril):
-        base_0 = pyro.sample(
-            name="base_0",
-            # dim(base): (P x 1) x G | C
-            fn=dist.MultivariateNormal(torch.zeros(C).to(self.device), scale_tril=scale_tril),
-        )
+    def sample_base(self, global_base, scale_tril):
         # dim(base): (P) x G x C
-        base = (loc.unsqueeze(-1) + base_0).squeeze(-3)
+        base = self.sample_base_0(global_base, scale_tril)
+        base = base + global_base.unsqueeze(-1).squeeze(-3)
         return base
 
-    def sample_gene_fuzz(self, loc, scale):
+    def sample_base_0(self, global_base, scale_tril):
+        base_0 = pyro.sample(
+            name="base_0",
+            # dim(base): (P) x 1 x G | C
+            fn=dist.MultivariateNormal(torch.zeros(1, 1, C).to(self.device), scale_tril=scale_tril),
+        )
+        # dim(base): (P) x G x C
+        base = base_0.squeeze(-3)
+        return base
+
+    def sample_gene_fuzz(self):
         gene_fuzz = pyro.sample(
             name="gene_fuzz",
             # dim(fuzz): (P) x 1 x G
-            fn=dist.LogNormal(loc, scale),
+            fn=dist.LogNormal(-2.0 * torch.zeros(1).to(self.device), torch.ones(1).to(self.device)),
         )
         return gene_fuzz
 
@@ -292,15 +302,15 @@ class Cellavi(pyro.nn.PyroModule):
         )
         return batch_fx
 
-    def sample_units(self):
-        units_KR = pyro.sample(
-            name="units_KR",
-            # dim(units_KR): (P) x KR x G
-            fn=dist.Normal(0.0 * torch.zeros(1, 1).to(self.device), 0.7 * torch.ones(1, 1).to(self.device)),
+    def sample_moduls(self, scale):
+        moduls_KR = pyro.sample(
+            name="moduls_KR",
+            # dim(moduls_KR): (P) x KR x G
+            fn=dist.Normal(torch.zeros(1, 1).to(self.device), scale),
         )
-        # dim(units): (P) x K x R x G
-        units = units_KR.view(units_KR.shape[:-2] + (K, R, G))
-        return units
+        # dim(moduls): (P) x K x R x G
+        moduls = moduls_KR.view(moduls_KR.shape[:-2] + (K, R, G))
+        return moduls
 
     def sample_c_indx(self, ctype_i, ctype_i_mask):
         c_indx = pyro.sample(
@@ -318,11 +328,13 @@ class Cellavi(pyro.nn.PyroModule):
     def return_ctype_as_is(self, ctype_i, cmask_i_mask):
         return ctype_i
 
-    def sample_theta_i(self):
+    def sample_theta_i(self, scale):
         log_theta_i = pyro.sample(
             name="log_theta_i",
             # dim(log_theta_i): (P) x ncells x 1 | K
-            fn=dist.Normal(torch.zeros(1, 1, K).to(self.device), torch.ones(1, 1, K).to(self.device)).to_event(1),
+            fn=dist.Normal(torch.zeros(1, 1, K).to(self.device), scale * torch.ones(1, 1, K).to(self.device)).to_event(
+                1
+            ),
         )
         # dim(theta_i): (P) x ncells x 1 x K
         theta_i = log_theta_i.softmax(dim=-1)
@@ -349,12 +361,12 @@ class Cellavi(pyro.nn.PyroModule):
         batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, ohb)
         return batch_fx_i
 
-    def compute_units_i(self, group, theta_i, units, indx_i):
+    def compute_moduls_i(self, group, theta_i, moduls, indx_i):
         # dim(ohg): ncells x R
-        ohg = subset(F.one_hot(group).to(units.dtype), indx_i)
-        # dim(units_i): (P) x ncells x G
-        units_i = torch.einsum("...noK,...KRG,nR->...nG", theta_i, units, ohg)
-        return units_i
+        ohg = subset(F.one_hot(group).to(moduls.dtype), indx_i)
+        # dim(moduls_i): (P) x ncells x G
+        moduls_i = torch.einsum("...noK,...KRG,nR->...nG", theta_i, moduls, ohg)
+        return moduls_i
 
     def compute_ELBO_z_i(self, x_ij, mu, sg, x_ij_mask, idx):
         # Parameters `mu` and `sg` are the prior parameters of the Poisson
@@ -416,33 +428,27 @@ class Cellavi(pyro.nn.PyroModule):
         pyro.factor("PLN_ELBO_term", mini_ELBO.sum(dim=-1, keepdim=True))
         return x_ij
 
-    #   def sample_log_rate_i(self, x_i, mu, gene_fuzz, gmask, idx=None):
-    #      delta_log_rate_i = pyro.sample(
-    #            name = "delta_log_rate_i",
-    #            # dim(delta_log_rate_i): (P) x ncells x G
-    #            fn = dist.Normal(
-    ##               torch.zeros(1,1).to(self.device),
-    #               mu,
-    #               gene_fuzz, # dim: (P) x 1 x G
-    #            ),
-    #      )
-    #      # dim(log_rate_i): C x (P) x ncells x G
-    ##      rate_i = torch.clamp(torch.exp(mu + delta_log_rate_i), max=1e6)
-    #      rate_i = torch.clamp(torch.exp(delta_log_rate_i), max=1e6)
-    #      x_i = pyro.sample(
-    #
-    #            name = "x_i",
-    #            # dim(x_i): ncells x G
-    #            fn = dist.Poisson(
-    #               rate = rate_i # dim: C x (P) x ncells x G
-    #            ),
-    #            obs = x_i,
-    #            obs_mask = gmask
-    #      )
-    #      return x_i
-
     #  ==  model description == #
     def model(self, idx=None):
+        # TODO: describe prior.
+
+        # dim(scale_moduls): (P x 1) x 1
+        scale_log_theta = pyro.sample(
+            name="scale_log_theta",
+            # dim(scale_log_theta): (P x 1) x 1
+            fn=dist.LogNormal(loc=-1.0 * torch.ones(1).to(self.device), scale=0.5 * torch.ones(1).to(self.device)),
+        )
+        # dim(scale_log_theta): (P x 1) x 1 x 1
+        scale_log_theta = scale_log_theta.unsqueeze(-2)
+
+        # The characteristic effect of the transcriptional modules
+        # is give by the scale parameter. `scale_moduls` has a
+        # log-normal distribution with 90% weight in the interval
+        # (0.15, 0.85).
+
+        # dim(scale_moduls): (P x 1) x 1
+        scale_moduls = self.output_scale_moduls()
+
         # The correlation between cell types is given by the LKJ
         # distribution with parameter eta = 1, which is a uniform
         # prior over C x C correlation matrices. The parameter
@@ -452,17 +458,6 @@ class Cellavi(pyro.nn.PyroModule):
 
         # dim(scale_tril_unit): (P x 1) x 1 | C x C
         scale_tril_unit = self.output_scale_tril_unit()
-
-        with pyro.plate("C", C, dim=-1):
-            # The parameter `scale_factor` describes the standard
-            # deviations for every cell type from the global
-            # baseline. The prior is exponential, with 90% weight
-            # in the interval (0.05, 3.00). The standard deviation
-            # is applied to all the genes so it describes how far
-            # the cell type is from the global baseline.
-
-            # dim(scale_factor): (P x 1) x 1 x C
-            scale_factor = self.output_scale_factor()
 
         with pyro.plate("B", B, dim=-2):
             # The parameter `batch_fx_scale` describes the standard
@@ -475,30 +470,23 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(batch_fx_scale): (P) x B x 1
             batch_fx_scale = self.output_batch_fx_scale()
 
+        with pyro.plate("C", C, dim=-1):
+            # The parameter `scale_factor` describes the standard
+            # deviations for every cell type from the global
+            # baseline. The prior is exponential, with 90% weight
+            # in the interval (0.05, 3.00). The standard deviation
+            # is applied to all the genes so it describes how far
+            # the cell type is from the global baseline.
+
+            # dim(scale_factor): (P x 1) x 1 x C
+            scale_factor = self.output_scale_factor()
+
         # Set up `scale_tril` from the correlation and the standard
         # deviation. This is the lower Cholesky factor of the co-
         # variance matrix (can be used directly in `Normal`).
 
-        # dim()scale_tril: (P x 1) x 1 x C x C
+        # dim(scale_tril): (P x 1) x 1 x C x C
         scale_tril = scale_factor.unsqueeze(-1) * scale_tril_unit
-
-        # The parameter `log_fuzz_loc` is the location parameter
-        # for the parameter `fuzz`. The prior is Gaussian, with
-        # 90% weight in the interval (-1.8, 0.2) and since `fuzz`
-        # is log-normal, its median has 90% chance of being in the
-        # interval (0.15, 0.85).
-
-        # dim(log_fuzz_loc): (P) x 1 x 1
-        log_fuzz_loc = self.output_log_fuzz_loc()
-
-        # The parameter `log_fuzz_scale` is the scale parameter
-        # for the parameter `fuzz`. The prior is exponential,
-        # with 90% weight in the interval (.15, 1.00), which
-        # indicates the typical dispersion of `fuzz` between
-        # genes as a log-normal variable.
-
-        # dim(log_fuzz_scale): (P) x 1 x 1
-        log_fuzz_scale = self.output_log_fuzz_scale()
 
         # Per-gene sampling.
         with pyro.plate("G", G, dim=-1):
@@ -526,20 +514,20 @@ class Cellavi(pyro.nn.PyroModule):
             # tail, the top 1% is 60,000 times higher than the
             # average.
 
-            # dim(base): (P) 1 x G | C
+            # dim(base): (P) x 1 x G | C
             base = self.output_base(global_base, scale_tril)
 
             # The parameter `gene_fuzz` is the standard deviation
             # for genes in the transcriptome. The prior is log-normal
-            # with location parameter `log_fuzz_loc` and scale
-            # parameter `log_fuzz_scale`. For every gene, the
+            # with location parameter
+            # For every gene, the
             # standard deviation is applied to all the cells, so it
             # describes how "fuzzy" a gene is, or on the contrary how
             # much it is determined by the cell type and its break down
-            # in transcriptional units.
+            # in transcriptional modules.
 
             # dim(fuzz): (P) x 1 x G
-            gene_fuzz = self.output_gene_fuzz(log_fuzz_loc, log_fuzz_scale)
+            gene_fuzz = self.output_gene_fuzz()
 
             # Per-batch, per-gene sampling.
             with pyro.plate("BxG", B, dim=-2):
@@ -557,11 +545,12 @@ class Cellavi(pyro.nn.PyroModule):
                 # lying in the interval (-1.15, 1.15), which
                 # corresponds to 3-fold effects.
 
-                # dim(units): (P) x K x R x G
-                units = self.output_units()
+                # dim(moduls): (P) x K x R x G
+                moduls = self.output_moduls(scale_moduls)
 
         # Per-cell sampling (on dimension -2).
-        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
+        #        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
+        with pyro.plate("ncells", self.ncells, dim=-2, device=self.device) as indx_i:
             # Subset data and mask.
             ctype_i = subset(self.ctype, indx_i)
             ctype_i_mask = subset(self.cmask, indx_i)
@@ -576,12 +565,12 @@ class Cellavi(pyro.nn.PyroModule):
 
             # Proportion of each unit in transcriptomes.
             # The proportions are computed from the softmax
-            # of K standard Gaussian variables. This means
-            # that there is a 90% chance that two proportions
-            # are within a factor 10 of each other.
+            # of K Gaussian variables. The parameters are chosen
+            # so that there is a 90% chance that two proportions
+            # are within a factor 5 or each other.
 
             # dim(theta_i): (P) x ncells x 1 x K
-            theta_i = self.output_theta_i()
+            theta_i = self.output_theta_i(scale_log_theta)
 
             # Deterministic functions to collect per-cell means.
 
@@ -591,11 +580,11 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(batch_fx_i): (P) x ncells x G
             batch_fx_i = self.collect_batch_fx_i(batch, batch_fx, indx_i, base.dtype)
 
-            # dim(units_i): (P) x ncells x G
-            units_i = self.collect_units_i(group, theta_i, units, indx_i)
+            # dim(moduls_i): (P) x ncells x G
+            moduls_i = self.collect_moduls_i(group, theta_i, moduls, indx_i)
 
             # Expected expression of gene in log space.
-            mu_i = base_i + batch_fx_i + units_i
+            mu_i = base_i + batch_fx_i + moduls_i
 
             if self.marginalize:
                 return self.compute_ELBO_z_i(x_i, mu_i, gene_fuzz, x_i_mask, indx_i)
@@ -608,38 +597,42 @@ class Cellavi(pyro.nn.PyroModule):
                         # dim(z_i): ncells x G
                         fn=dist.Normal(
                             torch.zeros(1, 1).to(self.device),
-                            gene_fuzz,
+                            0.1 * torch.ones(1, 1).to(self.device),
+                            #                            gene_fuzz,
                         ),
                     )
 
-                self._pyro_context.active += 1
-                # dim(c_indx_probs): ncells x 1 x C
-                c_indx_probs = self.c_indx_probs.detach()
-                self._pyro_context.active -= 1
-                # dim(c_indx_probs): C x 1 x ncells x 1
-                log_probs = c_indx_probs.detach().permute(2, 0, 1).unsqueeze(-3).log()
-
-                # FIXME: compute something during prototyping.
-                if base_i.dim() < 4:
-                    shift_i = 0
+                if self.need_to_infer_cell_type:
+                    self._pyro_context.active += 1
+                    # dim(c_indx_probs): ncells x 1 x C
+                    c_indx_probs = self.c_indx_probs.detach()
+                    self._pyro_context.active -= 1
+                    # dim(c_indx_probs): C x 1 x ncells x 1
+                    log_probs = c_indx_probs.detach().permute(2, 0, 1).unsqueeze(-3).log()
                 else:
-                    # Auto-shift.
-                    shift_i = x_i.sum(dim=-1, keepdim=True).log() - torch.logsumexp(
-                        z_i.detach() + mu_i.detach() + log_probs, dim=(-1, -4), keepdim=True
-                    )
+                    log_probs = 0.0
+
+                # Pad with two singletons to make sure `m` has enough dimensions,
+                # even when the model is called without parallel particles and
+                # without enumeration.
+                m = (mu_i.detach() + log_probs + z_i)[None, None, :]
+                shift_i = x_i.sum(dim=-1, keepdim=True).log() - torch.logsumexp(
+                    m[None, None, :], dim=(-1, -4), keepdim=True
+                )
 
                 rate_i = torch.clamp(torch.exp(z_i + mu_i + shift_i), max=1e6)
 
-                x = pyro.sample(
+                pyro.sample(
                     name="x_i",
-                    # dim(x_i): ncells | G
+                    # dim(x_i): ncells x 1 | G
                     fn=dist.Poisson(
                         rate=rate_i.unsqueeze(-2),
+                        validate_args=False,
                     ).to_event(1),
                     obs=x_i.unsqueeze(-2),
                 )
 
-                return x
+                return
 
     #  ==  guide description == #
     def guide(self, idx=None):
@@ -647,7 +640,8 @@ class Cellavi(pyro.nn.PyroModule):
         self.autonormal(idx)
 
         # Per-cell sampling (on dimension -2).
-        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
+        #        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
+        with pyro.plate("ncells", self.ncells, dim=-2, device=self.device) as indx_i:
             # Subset data and mask.
             ctype_i_mask = subset(self.cmask, indx_i)
 
@@ -655,7 +649,7 @@ class Cellavi(pyro.nn.PyroModule):
             self._pyro_context.active += 1
 
             # If more than one unit, sample them here.
-            if self.need_to_infer_units:
+            if self.need_to_infer_moduls:
                 # Posterior distribution of `log_theta_i`.
                 pyro.sample(
                     name="log_theta_i",
@@ -695,44 +689,42 @@ class Cellavi(pyro.nn.PyroModule):
             self._pyro_context.active -= 1
 
 
+def validate(data):
+    (ctype, batch, group, modul, X, (cmask, mmask)) = data
+    ncells = X.shape[0]
+    assert len(ctype) == ncells
+    assert len(batch) == ncells
+    assert len(group) == ncells
+    assert len(modul) == ncells
+    assert len(cmask) == ncells
+    assert len(mmask) == ncells
+
+
 if __name__ == "__main__":
     pl.seed_everything(123)
     pyro.set_rng_seed(123)
 
     torch.set_float32_matmul_precision("medium")
 
-    device = "cuda"
+    # TODO: Allow user to specify device.
+    device = "cuda:0"
 
     K = int(sys.argv[1])
     info_path = sys.argv[2]
     expr_path = sys.argv[3]
     out_path = sys.argv[4]
 
-    info = read_info(info_path)
+    info = read_info_from_file(info_path)
 
     ctype = info[0].to(device)
     batch = info[1].to(device)
     group = info[2].to(device)
-    label = info[3].to(device)
+    modul = info[3].to(device)
     cmask = info[4].to(device)
+    mmask = info[5].to(device)
 
-    X = torch.load(expr_path)
-    # XXX #
-    #   idx = torch.randperm(int(X.shape[0]))[:2048].sort().values
-    #   X = subset(X, idx).to(device)
-    #   X = X.to(device)
-
-    #   XX = X.to_dense().to(torch.float32)
-    #   totals = torch.zeros(C,G).to(torch.float32, "cuda")
-    #   index = ctype.unsqueeze(-1).expand(XX.shape).to("cuda")
-    #   totals.scatter_reduce_(dim=0, index=index, src=XX, reduce="sum")
-    #   probs = (totals + 1e-3) / (totals + 1e-3).sum(dim=-1).unsqueeze(dim=-1)
-    #   log_probs = probs.log()
-    #   all_prod = XX.unsqueeze(-3) * log_probs.unsqueeze(-2)
-    #   all_prod_sum = all_prod.sum(-1)
-    #   outcome = all_prod_sum.max(dim=0).indices
-
-    lmask = torch.zeros(X.shape[0], dtype=torch.bool).to(device)
+    X = read_dense_matrix(expr_path)
+    X = X.to(device)
 
     # Set the dimensions.
     B = int(batch.max() + 1)
@@ -740,21 +732,9 @@ if __name__ == "__main__":
     R = int(group.max() + 1)
     G = int(X.shape[-1])
 
-    # XXX #
-    B = 1  # <=== remove batches
-    batch = torch.zeros_like(batch)
-    #   batch = torch.zeros_like(batch[idx])
-    #   ctype = ctype[idx]
-    #   group = group[idx]
-    #   label = label[idx]
-    #   cmask = cmask[idx]
-
-    # XXX # Now Mask 10% of the cell types.
-    zo = torch.bernoulli(0.9 * torch.ones_like(cmask))
-    cmask &= zo.bool()
-
-    data = (ctype, batch, group, label, X, (cmask, lmask, None))
+    data = (ctype, batch, group, modul, X, (cmask, mmask))
     data_idx = range(X.shape[0])
+    validate(data)
 
     data_loader = torch.utils.data.DataLoader(
         dataset=data_idx,
@@ -763,15 +743,19 @@ if __name__ == "__main__":
     )
 
     pyro.clear_param_store()
-    cellavi = Cellavi(data, marginalize=True)
+    cellavi = Cellavi(data, marginalize=False)
     harnessed = plTrainHarness(cellavi)
+
+    updates_per_epoch = math.ceil(X.shape[0] / SUBSMPL)
+    num_epochs = math.ceil(max(MIN_CELL_UPDATES, MIN_TOT_UPDATES / updates_per_epoch))
 
     trainer = pl.Trainer(
         default_root_dir=".",
         strategy=pl.strategies.DeepSpeedStrategy(stage=2),
         accelerator="gpu",
+        devices=[0],
         gradient_clip_val=1.0,
-        max_epochs=NUM_EPOCHS,
+        max_epochs=num_epochs,
         enable_progress_bar=True,
         enable_model_summary=True,
         logger=pl.loggers.CSVLogger("."),
@@ -780,14 +764,8 @@ if __name__ == "__main__":
 
     trainer.fit(harnessed, data_loader)
 
-    # XXX # Print output.
-    oout = pyro.param("c_indx_probs").squeeze().max(dim=-1).indices[~cmask.cpu()]
-    print(ctype[~cmask].cpu())
-    print(oout)
-    print((oout.cpu() == ctype[~cmask].cpu()).sum() / len(oout))
-
     # Save output to file.
     param_store = pyro.get_param_store().get_state()
     for key, value in param_store["params"].items():
-        param_store["params"][key] = value.clone().cpu()
+        param_store["params"][key] = value.clone().cpu().squeeze()
     torch.save(param_store, out_path)
