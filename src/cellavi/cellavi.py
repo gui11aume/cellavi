@@ -118,9 +118,7 @@ class Cellavi(pyro.nn.PyroModule):
         self.cmask, self.mmask = masks
         self.gmask = self.X.isnan()
 
-        self.ctype = F.one_hot(self.ctype.view(-1, 1), num_classes=C).float()
-        self.cmask = self.cmask.view(-1, 1)
-        self.mmask = self.mmask.view(-1, 1)
+        self.ctype = F.one_hot(self.ctype, num_classes=C).float()
 
         self.device = self.X.device
         self.ncells = int(self.X.shape[0])
@@ -184,15 +182,15 @@ class Cellavi(pyro.nn.PyroModule):
         # 3) Define the guide parameters.
         if self.need_to_infer_cell_type:
             self.c_indx_probs = pyro.nn.module.PyroParam(
-                torch.ones(self.ncells, 1, C).to(self.device),
+                torch.ones(self.ncells, C).to(self.device),
                 constraint=torch.distributions.constraints.simplex,
                 event_dim=1,
             )
 
         if self.need_to_infer_moduls:
-            self.log_theta_i_loc = pyro.nn.module.PyroParam(torch.zeros(self.ncells, 1, K).to(self.device), event_dim=1)
+            self.log_theta_i_loc = pyro.nn.module.PyroParam(torch.zeros(self.ncells, K).to(self.device), event_dim=1)
             self.log_theta_i_scale = pyro.nn.module.PyroParam(
-                torch.ones(self.ncells, 1, K).to(self.device),
+                torch.ones(self.ncells, K).to(self.device),
                 constraint=torch.distributions.constraints.positive,
                 event_dim=1,
             )
@@ -283,7 +281,7 @@ class Cellavi(pyro.nn.PyroModule):
     def sample_c_indx(self, ctype_i, ctype_i_mask):
         c_indx = pyro.sample(
             name="cell_type",
-            # dim(c_indx): C x (P) x ncells x 1 | C
+            # dim(c_indx): C x (P) x 1 x ncells | C
             fn=dist.OneHotCategorical(
                 torch.ones(1, 1, C).to(self.device),
             ),
@@ -299,23 +297,19 @@ class Cellavi(pyro.nn.PyroModule):
     def sample_theta_i(self):
         log_theta_i = pyro.sample(
             name="log_theta_i",
-            # dim(log_theta_i): (P) x ncells x 1 | K
+            # dim(log_theta_i): (P) x 1 x ncells | K
             fn=dist.Normal(torch.zeros(1, 1, K).to(self.device), torch.ones(1, 1, K).to(self.device)).to_event(1),
         )
-        # dim(theta_i): (P) x ncells x 1 x K
+        # dim(theta_i): (P) x 1 x ncells x K
         theta_i = log_theta_i.softmax(dim=-1)
         return theta_i
 
     def compute_base_i_enum(self, c_indx, base):
-        # dim(c_indx): z x ncells x C (z = 1 or C)
-        c_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
         # dim(base_i): z x (P) x ncells x G (z = 1 or C)
         base_i = torch.einsum("znC,...GC->z...nG", c_indx, base)
         return base_i
 
     def compute_base_i_no_enum(self, c_indx, base):
-        # dim(c_indx): ncells x C
-        c_indx = c_indx.squeeze(-2)
         # dim(base_i): (P) x ncells x G
         base_i = torch.einsum("nC,...GC->...nG", c_indx, base)
         return base_i
@@ -331,7 +325,7 @@ class Cellavi(pyro.nn.PyroModule):
         # dim(ohg): ncells x R
         ohg = subset(F.one_hot(group).to(moduls.dtype), indx_i)
         # dim(moduls_i): (P) x ncells x G
-        moduls_i = torch.einsum("...noK,...KRG,nR->...nG", theta_i, moduls, ohg)
+        moduls_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, moduls, ohg)
         return moduls_i
 
     #  ==  model description == #
@@ -423,8 +417,8 @@ class Cellavi(pyro.nn.PyroModule):
                 # dim(moduls): (P) x K x R x G
                 moduls = self.output_moduls()
 
-        # Per-cell sampling (on dimension -2).
-        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
+        # Per-cell sampling.
+        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
             # Subset data and mask.
             ctype_i = subset(self.ctype, indx_i)
             ctype_i_mask = subset(self.cmask, indx_i)
@@ -433,7 +427,7 @@ class Cellavi(pyro.nn.PyroModule):
             # Cell types as discrete indicators. The prior
             # distiribution is uniform over known cell types.
 
-            # dim(c_indx): C x (P) x ncells x 1
+            # dim(c_indx): C x (P) x 1 x ncells
             c_indx = self.output_c_indx(ctype_i, ctype_i_mask)
 
             # Proportion of each modul in transcriptomes.
@@ -457,16 +451,17 @@ class Cellavi(pyro.nn.PyroModule):
             moduls_i = self.collect_moduls_i(group, theta_i, moduls, indx_i)
 
             # Expected expression of gene in log space (logits).
+            # dim(mu_i): (P) x ncells x G
             mu_i = base_i + batch_fx_i + moduls_i
 
             x = pyro.sample(
                 name="x_i",
                 # dim(x_i): ncells | G
                 fn=dist.Multinomial(
-                    logits=mu_i.unsqueeze(-2),
+                    logits=mu_i,
                     validate_args=False,
                 ),
-                obs=x_i.unsqueeze(-2),
+                obs=x_i,
             )
 
             return x
@@ -476,8 +471,8 @@ class Cellavi(pyro.nn.PyroModule):
         # Sample all non-cell variables.
         self.autonormal(idx)
 
-        # Per-cell sampling (on dimension -2).
-        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
+        # Per-cell sampling
+        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
             # TODO: find canonical way to enter context of the module.
             self._pyro_context.active += 1
 
@@ -489,7 +484,7 @@ class Cellavi(pyro.nn.PyroModule):
                 # Posterior distribution of `log_theta_i`.
                 pyro.sample(
                     name="log_theta_i",
-                    # dim(log_theta_i): (P) x ncells x 1 | K
+                    # dim(log_theta_i): (P) x 1 x ncells | K
                     fn=dist.Normal(
                         self.log_theta_i_loc,
                         self.log_theta_i_scale,
