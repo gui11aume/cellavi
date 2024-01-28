@@ -21,7 +21,7 @@ global G  # Number of genes / from data.
 
 
 DEBUG = False
-SUBSMPL = 512
+SUBSMPL = 524
 NUM_PARTICLES = 12
 NUM_EPOCHS = 2048
 
@@ -97,9 +97,12 @@ class plTrainHarness(pl.LightningModule):
 
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
-    def training_step(self, batch, batch_idx):
-        # idx = batch.sort().values
-        loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
+    def training_step(self, batch):
+        # Note: sorting the indices of the subsample is critical because
+        # Pyro messengers subsample in sorted order. Without this line,
+        # the parameters are completely randomized in the guide.
+        idx = batch.sort().values
+        loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
         (lr,) = self.lr_schedulers().get_last_lr()
         info = {"loss": loss, "lr": lr}
         self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
@@ -421,8 +424,7 @@ class Cellavi(pyro.nn.PyroModule):
                 moduls = self.output_moduls()
 
         # Per-cell sampling (on dimension -2).
-        # with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
-        with pyro.plate("ncells", self.ncells, dim=-2, device=self.device) as indx_i:
+        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
             # Subset data and mask.
             ctype_i = subset(self.ctype, indx_i)
             ctype_i_mask = subset(self.cmask, indx_i)
@@ -434,7 +436,7 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(c_indx): C x (P) x ncells x 1
             c_indx = self.output_c_indx(ctype_i, ctype_i_mask)
 
-            # Proportion of each unit in transcriptomes.
+            # Proportion of each modul in transcriptomes.
             # The proportions are computed from the softmax
             # of K standard Gaussian variables. This means
             # that there is a 90% chance that two proportions
@@ -454,7 +456,7 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(moduls_i): (P) x ncells x G
             moduls_i = self.collect_moduls_i(group, theta_i, moduls, indx_i)
 
-            # Expected expression of gene in log space.
+            # Expected expression of gene in log space (logits).
             mu_i = base_i + batch_fx_i + moduls_i
 
             x = pyro.sample(
@@ -475,13 +477,12 @@ class Cellavi(pyro.nn.PyroModule):
         self.autonormal(idx)
 
         # Per-cell sampling (on dimension -2).
-        # with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
-        with pyro.plate("ncells", self.ncells, dim=-2, device=self.device) as indx_i:
-            # Subset data and mask.
-            ctype_i_mask = subset(self.cmask, indx_i)
-
+        with pyro.plate("ncells", self.ncells, dim=-2, subsample=idx, device=self.device) as indx_i:
             # TODO: find canonical way to enter context of the module.
             self._pyro_context.active += 1
+
+            # Subset data and mask.
+            ctype_i_mask = subset(self.cmask, indx_i)
 
             # If more than one unit, sample them here.
             if self.need_to_infer_moduls:
@@ -502,7 +503,7 @@ class Cellavi(pyro.nn.PyroModule):
                         name="cell_type_unobserved",
                         # dim(c_indx): C x 1 x 1 x 1 | C
                         fn=dist.OneHotCategorical(
-                            self.c_indx_probs  # dim: ncells x 1 | C
+                            self.c_indx_probs,
                         ),
                         infer={"enumerate": "parallel"},
                     )
@@ -584,5 +585,5 @@ if __name__ == "__main__":
     # Save output to file.
     param_store = pyro.get_param_store().get_state()
     for key, value in param_store["params"].items():
-        param_store["params"][key] = value.clone().cpu()
+        param_store["params"][key] = value.clone().squeeze().cpu()
     torch.save(param_store, out_path)
