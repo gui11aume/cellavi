@@ -583,7 +583,7 @@ class Cellavi(pyro.nn.PyroModule):
             if self.need_to_infer_moduls:
                 # Posterior distribution of `log_theta_i`.
                 pyro.sample(
-                    name="log_theta_i",
+                    name="log_theta_i_unobserved",
                     # dim(log_theta_i): (P) x 1 x ncells | K
                     fn=dist.Normal(
                         self.log_theta_i_loc,
