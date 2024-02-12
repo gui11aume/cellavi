@@ -21,7 +21,7 @@ global G  # Number of genes / from data.
 
 
 DEBUG = False
-SUBSMPL = 524
+SUBSMPL = 512
 NUM_PARTICLES = 12
 NUM_EPOCHS = 2048
 
@@ -184,7 +184,7 @@ class Cellavi(pyro.nn.PyroModule):
             self.output_theta_i = self.zero
             self.collect_probs_i = self.zero
 
-        if cmask.all():
+        if cmask.all() or C == 1:
             self.need_to_infer_cell_type = False
             self.output_c_indx = self.return_ctype_as_is
             self.collect_base_i = self.compute_base_i_no_enum
@@ -295,8 +295,8 @@ class Cellavi(pyro.nn.PyroModule):
         batch_fx_scale = pyro.sample(
             name="batch_fx_scale",
             # dim(base): (P) x 1 x B
-            fn=dist.Exponential(
-                5.0 * torch.ones(1, 1).to(self.device),
+            fn=dist.HalfNormal(
+                0.05 * torch.ones(1, 1).to(self.device),
             ),
         )
         return batch_fx_scale
@@ -430,10 +430,14 @@ class Cellavi(pyro.nn.PyroModule):
         with pyro.plate("B", B, dim=-2):
             # The parameter `batch_fx_scale` describes the standard
             # deviations for every batch from the transcriptome of
-            # the cell type. The prior is exponential, with 90% weight
-            # in the interval (0.01, 0.60). The standard deviation
-            # is applied to all the genes so it describes how far
-            # the batch is from the prototype transcriptome.
+            # the cell type. The prior is half-normal, the quantiles
+            # 0.9, .99, .9999 equal to .064, .116 and .186. Beyond
+            # this, the probabilities drop fast, so that values
+            # above 0.25 are exceedingly unlikely. The standard
+            # deviation is applied to all the genes so it describes
+            # how far the batch is from the baseline transcriptome.
+            # A value of 0.25 means that every gene in the batch may
+            # vary by a factor ~2 compared to the baseline.
 
             # dim(batch_fx_scale): (P) x B x 1
             batch_fx_scale = self.output_batch_fx_scale()
@@ -474,6 +478,8 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(base): (P) 1 x G | C
             base = self.output_base(global_base, scale_tril)
 
+            # TODO: give a proper name to this variable and
+            # describe the prior.
             the_scale = pyro.sample(
                 name="the_scale",
                 # dim(the_scale): (P) x 1 x G
