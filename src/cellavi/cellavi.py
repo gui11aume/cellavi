@@ -37,6 +37,25 @@ def subset(tensor, idx):
     return tensor.index_select(0, idx.to(tensor.device))
 
 
+class UnconditionMessenger(pyro.poutine.messenger.Messenger):
+    """A modified version of `pyro.poutine.messenger.UnconditionMessenger`
+    where it is possible to specify which sites to uncondition."""
+
+    def __init__(self, sites=[]):
+        self.sites = sites
+
+    def _pyro_sample(self, msg):
+        if msg["name"] in self.sites and msg["is_observed"]:
+            # The code below is taken from the
+            # original `UnconditionMessenger`.
+            msg["is_observed"] = False
+            assert msg["infer"] is not None
+            msg["infer"]["was_observed"] = True
+            msg["infer"]["obs"] = msg["value"]
+            msg["value"] = None
+            msg["done"] = False
+
+
 class plTrainHarness(pl.LightningModule):
     def __init__(self, cellavi, lr=0.01):
         super().__init__()
@@ -195,7 +214,7 @@ class Cellavi(pyro.nn.PyroModule):
 
         # 2) Define the autoguide.
         self.autonormal = AutoNormal(
-            pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i"])
+            pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"])
         )
 
         # 3) Define the guide parameters.
@@ -263,14 +282,27 @@ class Cellavi(pyro.nn.PyroModule):
             init_loc_fn=self.init_loc_fn,
         )
 
-    #  == Helper functions == #
+    #  == Predict ==  #
+    def predict(self, num_samples=200):
+        guide = pyro.plate("samples", 10, dim=-3)(self.guide)
+        model = pyro.plate("samples", 10, dim=-3)(self.model)
+        samples = list()
+        with UnconditionMessenger(sites=["x_i"]), torch.no_grad():
+            for _ in range(0, num_samples, 10):
+                guide_trace = pyro.poutine.trace(guide).get_trace()
+                model_trace = pyro.poutine.trace(pyro.poutine.replay(model, guide_trace)).get_trace()
+                samples.append(model_trace.nodes["x_i"]["value"])
+            sample = torch.cat(samples, dim=0).squeeze()
+        return sample
+
+    #  == Helper functions ==  #
     def zero(self, *args, **kwargs):
         return torch.zeros(1).to(self.device)
 
     def one(self, *args, **kwargs):
         return torch.ones(1).to(self.device)
 
-    #  ==  Model parts == #
+    #  ==  Model parts ==  #
     def sample_scale_tril_unit(self):
         scale_tril_unit = pyro.sample(
             name="scale_tril_unit",
@@ -400,8 +432,8 @@ class Cellavi(pyro.nn.PyroModule):
         ohg = subset(F.one_hot(group).to(moduls.dtype), indx_i)
         moduls_i = torch.einsum("...KRG,nR->...KnG", moduls, ohg)
         profiles_i = (moduls_i + base.unsqueeze(-3)).softmax(dim=-1)
-        # dim(probs_i): (P) x ncells x G
-        probs_i = torch.einsum("...onK,...KnG->...nG", theta_i, profiles_i)
+        # dim(probs_i): (P) x 1 x ncells x G
+        probs_i = torch.einsum("...onK,...KnG->...onG", theta_i, profiles_i)
         return probs_i
 
     #  ==  model description == #
@@ -558,16 +590,19 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(base_prob): (P) x ncells x G
             mu_i_plus_z_i = mu_i + z_i
 
-            # dim(probs_i): (P) x ncells x G
+            # dim(probs_i): (P) x 1 x ncells x G
             probs_i = self.collect_probs_i(group, theta_i, mu_i_plus_z_i, moduls, indx_i)
+
+            # dim(rate_i): (P) x 1 x ncells x G
+            rate_i = probs_i * x_i.sum(dim=-1, keepdim=True)
 
             x = pyro.sample(
                 name="x_i",
-                # dim(x_i): ncells | G
-                fn=dist.Multinomial(
-                    probs=probs_i,
+                # dim(x_i): (P) x 1 x ncells | G
+                fn=dist.Poisson(
+                    rate=rate_i,
                     validate_args=False,
-                ),
+                ).to_event(1),
                 obs=x_i,
             )
 
@@ -588,7 +623,7 @@ class Cellavi(pyro.nn.PyroModule):
             # If more than one unit, sample them here.
             if self.need_to_infer_moduls:
                 # Posterior distribution of `log_theta_i`.
-                pyro.sample(
+                log_theta_i = pyro.sample(
                     name="log_theta_i_unobserved",
                     # dim(log_theta_i): (P) x 1 x ncells | K
                     fn=dist.Normal(
@@ -596,6 +631,7 @@ class Cellavi(pyro.nn.PyroModule):
                         self.log_theta_i_scale,
                     ).to_event(1),
                 )
+                log_theta_i.shape
 
             with pyro.plate("Gxncells", G):
                 pyro.sample(
@@ -666,32 +702,43 @@ if __name__ == "__main__":
     data_idx = range(X.shape[0])
     validate(data)
 
-    data_loader = torch.utils.data.DataLoader(
-        dataset=data_idx,
-        shuffle=True,
-        batch_size=SUBSMPL,
-    )
-
     pyro.clear_param_store()
     cellavi = Cellavi(data)
-    harnessed = plTrainHarness(cellavi)
 
-    trainer = pl.Trainer(
-        default_root_dir=".",
-        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
-        accelerator="gpu",
-        gradient_clip_val=1.0,
-        max_epochs=NUM_EPOCHS,
-        enable_progress_bar=True,
-        enable_model_summary=True,
-        logger=pl.loggers.CSVLogger("."),
-        enable_checkpointing=False,
-    )
+    # TODO: improve this bit.
+    if len(sys.argv) > 5:
+        # Prediction.
+        store = torch.load(sys.argv[5])
+        for key in store["params"]:
+            store["params"][key] = store["params"][key].to(device)
+        pyro.get_param_store().set_state(store)
+        sample = cellavi.predict()
+    else:
+        # Fitting.
+        data_loader = torch.utils.data.DataLoader(
+            dataset=data_idx,
+            shuffle=True,
+            batch_size=SUBSMPL,
+        )
 
-    trainer.fit(harnessed, data_loader)
+        harnessed = plTrainHarness(cellavi)
 
-    # Save output to file.
-    param_store = pyro.get_param_store().get_state()
-    for key, value in param_store["params"].items():
-        param_store["params"][key] = value.clone().squeeze().cpu()
-    torch.save(param_store, out_path)
+        trainer = pl.Trainer(
+            default_root_dir=".",
+            strategy=pl.strategies.DeepSpeedStrategy(stage=2),
+            accelerator="gpu",
+            gradient_clip_val=1.0,
+            max_epochs=NUM_EPOCHS,
+            enable_progress_bar=True,
+            enable_model_summary=True,
+            logger=pl.loggers.CSVLogger("."),
+            enable_checkpointing=False,
+        )
+
+        trainer.fit(harnessed, data_loader)
+
+        # Save output to file.
+        param_store = pyro.get_param_store().get_state()
+        for key, value in param_store["params"].items():
+            param_store["params"][key] = value.clone().cpu()
+        torch.save(param_store, out_path)

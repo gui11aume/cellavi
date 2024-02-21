@@ -9,8 +9,8 @@ exclude = [
     ".vscode",
 ]
 line-length = 120
-ignore = ["E741", "E721"]
-select = ["E", "F", "I"]
+lint.ignore = ["E741", "E721"]
+lint.select = ["E", "F", "I"]
 
 [tool.poetry]
 name = "cellavi"
