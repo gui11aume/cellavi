@@ -86,27 +86,35 @@ def read_info_from_file(path):
             list_of_groups.append(info[indices.get("group", -1)])
             list_of_states.append(info[indices.get("state", -1)])
 
-    unique_ctypes = sorted(list(set(list_of_ctypes)))
-    if "?" in unique_ctypes:
-        unique_ctypes.remove("?")
-        ctype_mask = [ctype != "?" for ctype in list_of_ctypes]
+    if "ctype" not in indices:
+        ctypes_tensor = torch.tensor(list_of_ctypes)
+        ctype_mask_tensor = torch.zeros_like(ctypes_tensor).bool()
     else:
-        ctype_mask = [True] * len(list_of_ctypes)
-    ctype_mask_tensor = torch.tensor(ctype_mask, dtype=torch.bool)
-    list_of_ctype_ids = [unique_ctypes.index(x) if x in unique_ctypes else 0 for x in list_of_ctypes]
-    ctypes_tensor = torch.tensor(list_of_ctype_ids)
-    ctypes_tensor[~ctype_mask_tensor] = 0
+        unique_ctypes = sorted(list(set(list_of_ctypes)))
+        if "?" in unique_ctypes:
+            unique_ctypes.remove("?")
+            ctype_mask = [ctype != "?" for ctype in list_of_ctypes]
+        else:
+            ctype_mask = [True] * len(list_of_ctypes)
+        ctype_mask_tensor = torch.tensor(ctype_mask, dtype=torch.bool)
+        list_of_ctype_ids = [unique_ctypes.index(x) if x in unique_ctypes else 0 for x in list_of_ctypes]
+        ctypes_tensor = torch.tensor(list_of_ctype_ids)
+        ctypes_tensor[~ctype_mask_tensor] = 0
 
-    unique_states = sorted(list(set(list_of_states)))
-    if "?" in unique_states:
-        unique_states.remove("?")
-        state_mask = [state != "?" for state in list_of_states]
+    if "state" not in indices:
+        states_tensor = torch.tensor(list_of_states)
+        state_mask_tensor = torch.zeros_like(states_tensor).bool()
     else:
-        state_mask = [True] * len(list_of_states)
-    state_mask_tensor = torch.tensor(state_mask, dtype=torch.bool)
-    list_of_state_ids = [unique_states.index(x) if x in unique_states else 0 for x in list_of_states]
-    states_tensor = torch.tensor(list_of_state_ids)
-    states_tensor[~state_mask_tensor] = 0
+        unique_states = sorted(list(set(list_of_states)))
+        if "?" in unique_states:
+            unique_states.remove("?")
+            state_mask = [state != "?" for state in list_of_states]
+        else:
+            state_mask = [True] * len(list_of_states)
+        state_mask_tensor = torch.tensor(state_mask, dtype=torch.bool)
+        list_of_state_ids = [unique_states.index(x) if x in unique_states else 0 for x in list_of_states]
+        states_tensor = torch.tensor(list_of_state_ids)
+        states_tensor[~state_mask_tensor] = 0
 
     unique_batches = sorted(list(set(list_of_batches)))
     list_of_batch_ids = [unique_batches.index(x) for x in list_of_batches]

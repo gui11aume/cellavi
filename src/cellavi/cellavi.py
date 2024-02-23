@@ -23,7 +23,9 @@ global G  # Number of genes / from data.
 DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
-NUM_EPOCHS = 2048
+MIN_NUM_GLOBAL_UPDATES = 2048
+MIN_NUM_CELL_UPDATES = 24
+
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
@@ -80,7 +82,15 @@ class plTrainHarness(pl.LightningModule):
             )
 
         # Instantiate parameters of autoguides.
-        if self.cellavi.need_to_infer_moduls or self.cellavi.need_to_infer_cell_type:
+        available_ctypes = torch.unique(self.cellavi.ctype[self.cellavi.cmask])
+        missing_ctypes = set(torch.arange(C).tolist()).difference(available_ctypes.tolist())
+        # Condition 1: need to infer cell types, some lables without examples.
+        condition_1 = self.cellavi.need_to_infer_cell_type and missing_ctypes
+        available_moduls = torch.unique(self.cellavi.label[self.cellavi.smask])
+        missing_moduls = set(torch.arange(K).tolist()).difference(available_moduls.tolist())
+        # Condition 2: need to infer moduls, some lables without examples.
+        condition_2 = self.cellavi.need_to_infer_moduls and missing_moduls
+        if condition_1 or condition_2:
             self.find_initial_conditions()
 
         # Instantiate parameters of autoguides.
@@ -103,12 +113,12 @@ class plTrainHarness(pl.LightningModule):
         if seed is None:
             for seed in range(sweep):
                 pyro.set_rng_seed(seed)
-                self.cellavi.reinitialize_auto_guide()
+                self.cellavi.initialize_auto_guide()
                 loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
                 losses.append(float(loss))
             loss, seed = min([(x, i) for (i, x) in enumerate(losses)])
         pyro.set_rng_seed(seed)
-        self.cellavi.reinitialize_auto_guide()
+        self.cellavi.initialize_auto_guide()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -146,9 +156,22 @@ class plTrainHarness(pl.LightningModule):
         self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
         return loss
 
+    def compute_num_training_epochs(self):
+        updates_per_epoch = int(self.cellavi.ncells / self.cellavi.bsz)
+        num_epochs = int(MIN_NUM_GLOBAL_UPDATES / updates_per_epoch)
+        # We need a minimum of `MIN_NUM_GLOBAL_UPDATES` updates for
+        # global parameters. If we marginalize and do not compute
+        # moduls (e.g., we infer cell types), there are no per-cell
+        # parameters. Otherwise, there are per-cell parameters that
+        # require at least `MIN_NUM_CELL_UPDATES` updates.
+        if self.cellavi.need_to_infer_moduls or self.cellavi.marginalize is False:
+            return max(MIN_NUM_CELL_UPDATES, num_epochs)
+        else:
+            return num_epochs
+
 
 class Cellavi(pyro.nn.PyroModule):
-    def __init__(self, data):
+    def __init__(self, data, marginalize=True):
         super().__init__()
 
         # Unpack data.
@@ -160,18 +183,21 @@ class Cellavi(pyro.nn.PyroModule):
         # This is done by assigning value +2.3 or -2.3 so that the logits
         # stand for probabilities equal to 0.01 or 0.99.
         self.one_hot_label = F.one_hot(self.label, num_classes=K).to(self.X.dtype)
-        self.slabel = 4.6 * self.one_hot_label - 2.3 if K > 1 else 0.0
+        self.slabel = 4.6 * self.one_hot_label - 2.3 if K > 1 else self.one_hot_label
 
         self.device = self.X.device
         self.ncells = int(self.X.shape[0])
 
         self.bsz = self.ncells if self.ncells < SUBSMPL else SUBSMPL
 
+        self.marginalize = marginalize
+
         # 1a) Define core parts of the model.
         self.output_scale_tril_unit = self.sample_scale_tril_unit
         self.output_scale_factor = self.sample_scale_factor
         self.output_global_base = self.sample_global_base
         self.output_base = self.sample_base
+        self.output_scale_z = self.sample_scale_z
 
         # 1b) Define optional parts of the model.
         if B > 1:
@@ -196,12 +222,12 @@ class Cellavi(pyro.nn.PyroModule):
             self.need_to_infer_moduls = True
             self.output_moduls = self.sample_moduls
             self.output_theta_i = self.sample_theta_i
-            self.collect_probs_i = self.compute_probs_i
+            self.collect_moduls_i = self.compute_moduls_i
         else:
             self.need_to_infer_moduls = False
             self.output_moduls = self.zero
             self.output_theta_i = self.zero
-            self.collect_probs_i = self.zero
+            raise NotImplementedError
 
         if cmask.all() or C == 1:
             self.need_to_infer_cell_type = False
@@ -213,17 +239,16 @@ class Cellavi(pyro.nn.PyroModule):
             self.collect_base_i = self.compute_base_i_enum
 
         # 2) Define the autoguide.
-        self.autonormal = AutoNormal(
-            pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"])
-        )
+        self.initialize_auto_guide()
 
         # 3) Define the guide parameters.
-        self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(G, self.ncells).to(self.device), event_dim=0)
-        self.z_i_scale = pyro.nn.module.PyroParam(
-            torch.ones(G, self.ncells).to(self.device),
-            constraint=torch.distributions.constraints.positive,
-            event_dim=0,
-        )
+        if self.marginalize is False:
+            self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(G, self.ncells).to(self.device), event_dim=0)
+            self.z_i_scale = pyro.nn.module.PyroParam(
+                torch.ones(G, self.ncells).to(self.device),
+                constraint=torch.distributions.constraints.positive,
+                event_dim=0,
+            )
 
         if self.need_to_infer_cell_type:
             # Initialize `c_indx_probs` randomly for cells where the
@@ -262,29 +287,43 @@ class Cellavi(pyro.nn.PyroModule):
             return rows - rows.mean(dim=0, keepdim=True)
         if site["name"] == "base_0":
             avlog = torch.log(0.5 + self.X).mean(dim=0, keepdim=True)
-            if self.cmask.all():
-                zero = torch.zeros(C, G).to(self.device)
-                index = self.ctype.unsqueeze(-1).expand(self.X.shape)
-                base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X), "mean")
-                return (base_0 - avlog).transpose(-1, -2)
+            if self.cmask.any():
+                if len(torch.unique(self.ctype[self.cmask])) == C:
+                    # At least one example is available for every label.
+                    zero = torch.zeros(C, G).to(self.device)
+                    index = self.ctype[self.cmask].unsqueeze(-1).expand(self.X[self.cmask].shape)
+                    base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X[self.cmask]), "mean")
+                else:
+                    # Some labels have no known examples.
+                    zero = torch.zeros(C, G).to(self.device)
+                    index = self.ctype.unsqueeze(-1).expand(self.X.shape)
+                    base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X), "mean")
+                    # Recompute label 0 plus all those that are missing.
+                    available = torch.unique(self.ctype[self.cmask])
+                    missing = set(torch.arange(C).tolist()).difference(available.tolist())
+                    idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, len(missing)).to(self.device)
+                    base_0[list(missing)] = subset(torch.log(0.5 + self.X), idx)
+                    if 0 in available:
+                        base_0[0] = torch.mean(torch.log(0.5 + self.X[self.ctype == 0 & self.cmask]))
             else:
-                idx = torch.multionomial(torch.ones(self.ncells) / self.ncells, C).to(self.device)
+                idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, C).to(self.device)
                 base_0 = subset(torch.log(0.5 + self.X), idx)
-                return (base_0 - avlog).transpose(-1, -2)
+            return (base_0 - avlog).transpose(-1, -2)
         if site["name"] == "global_base":
             avlog = torch.log(0.5 + self.X).mean(dim=0, keepdim=True)
             return avlog - avlog.mean()
 
-    def reinitialize_auto_guide(self):
+    def initialize_auto_guide(self):
         # Reinitialize the parameters of the autoguide.
         self.autonormal = AutoNormal(
-            pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i"]),
+            pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"]),
             init_loc_fn=self.init_loc_fn,
         )
 
     #  == Predict ==  #
-    def predict(self, num_samples=200):
-        guide = pyro.plate("samples", 10, dim=-3)(self.guide)
+    def predict(self, num_samples=200, resample_PLN=True):
+        hide = ["z_i"] if resample_PLN else []
+        guide = pyro.plate("samples", 10, dim=-3)(pyro.poutine.block(self.guide, hide=hide))
         model = pyro.plate("samples", 10, dim=-3)(self.model)
         samples = list()
         with UnconditionMessenger(sites=["x_i"]), torch.no_grad():
@@ -355,6 +394,16 @@ class Cellavi(pyro.nn.PyroModule):
         base = (global_base.unsqueeze(-1) + base_0).squeeze(-3)
         return base
 
+    def sample_scale_z(self):
+        scale_z = pyro.sample(
+            name="scale_z",
+            # dim(scale_z): (P) x 1 x G
+            fn=dist.Exponential(7.0 * torch.ones(1, 1).to(self.device)),
+        )
+        # dim(scale_z): (P) x G x 1
+        scale_z = scale_z.transpose(-1, -2)
+        return scale_z
+
     def reshape_global_base(self, global_base, scale_tril):
         # dim(base): (P) x G x 1
         base = global_base[None, ...].unsqueeze(-1).squeeze(-3)
@@ -409,6 +458,8 @@ class Cellavi(pyro.nn.PyroModule):
         return theta_i
 
     def compute_base_i_enum(self, c_indx, base):
+        # dim(c_indx): z x ncells x C (z = 1 or C)
+        c_indx = c_indx.view((c_indx.shape[0],) + c_indx.shape[-2:])
         # dim(base_i): z x (P) x ncells x G (z = 1 or C)
         base_i = torch.einsum("znC,...GC->z...nG", c_indx, base)
         # dim(base_i): (P) x ncells x G or C x (P) x ncells x G
@@ -420,21 +471,109 @@ class Cellavi(pyro.nn.PyroModule):
         base_i = torch.einsum("nC,...GC->...nG", c_indx, base)
         return base_i
 
-    def compute_batch_fx_i(self, batch, batch_fx, indx_i, dtype):
+    def compute_batch_fx_i(self, batch, batch_fx, indx_i):
         # dim(ohg): ncells x B
-        ohb = subset(F.one_hot(batch).to(dtype), indx_i)
+        ohb = subset(F.one_hot(batch).to(batch_fx), indx_i)
         # dim(batch_fx_i): (P) x ncells x G
         batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, ohb)
         return batch_fx_i
 
-    def compute_probs_i(self, group, theta_i, base, moduls, indx_i):
+    def compute_moduls_i(self, group, theta_i, moduls, indx_i):
         # dim(ohg): ncells x R
         ohg = subset(F.one_hot(group).to(moduls.dtype), indx_i)
-        moduls_i = torch.einsum("...KRG,nR->...KnG", moduls, ohg)
-        profiles_i = (moduls_i + base.unsqueeze(-3)).softmax(dim=-1)
-        # dim(probs_i): (P) x 1 x ncells x G
-        probs_i = torch.einsum("...onK,...KnG->...onG", theta_i, profiles_i)
-        return probs_i
+        # dim(moduls_i): (P) x ncells x G
+        moduls_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, moduls, ohg)
+        return moduls_i
+
+    def compute_ELBO_z_i(self, x_ij, mu, sg, idx):
+        # Parameters `mu` and `sg` are the prior parameters of the Poisson
+        # LogNormal distribution. The variational posterior parameters
+        # given the observations `x_ij` are `xi` and `w2_i`. In this case
+        # we can compute the ELBO analytically and maximize it with respect
+        # to `xi` and `w2_i` so as to pass the gradient to `mu` and `sg`.
+        # This allows us to compute the ELBO efficiently without having
+        # to store parameters and gradients for `xi` and `w2_i`.
+
+        # dim(sg): (P) x 1 x G
+        sg = sg.transpose(-1, -2)
+        s2 = torch.square(sg)
+
+        #        log_P = math.log(mu[None].shape[-3])
+        #        if self.need_to_infer_cell_type:
+        #            self._pyro_context.active += 1
+        #            # dim(c_indx_probs): ncells x 1 x C
+        #            c_indx_probs = self.c_indx_probs.detach()
+        #            self._pyro_context.active -= 1
+        #            # dim(log_probs): C x ncells x 1
+        #            log_probs = c_indx_probs.detach().permute(2, 0, 1).log()
+        #            # dim(log_probs): C x 1 x 1 x ncells x 1
+        #            log_probs = log_probs.unsqueeze(-3).unsqueeze(-3)
+        #        else:
+        #            log_probs = 0.
+
+        # No gradient.
+        # dim(mu_): ncells x G
+        mu_ = mu[None].mean(dim=-3).detach()
+        s2_ = 1.0 / (1.0 / s2[None].detach()).mean(dim=-3)
+
+        xlog = x_ij.sum(dim=-1, keepdim=True).log()
+
+        T_ = xlog - torch.logsumexp(mu_, dim=-1, keepdim=True)
+        nu = -0.5 * torch.ones_like(mu_)
+        for _ in range(4):
+            k2 = s2_ / (s2_ * x_ij + 1 - nu)
+            f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
+            df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
+            nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
+
+        for _ in range(12):
+            nu__ = torch.clamp(nu - 1.0 / df, max=x_ij * s2_ - 0.01)
+            k2__ = s2_ / (s2_ * x_ij + 1 - nu__)
+            l1 = torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
+            l2 = torch.logsumexp(mu_ + nu__ + 0.5 * k2__, dim=-1, keepdim=True)
+            delta = torch.clamp(-(T_ - xlog + l1) / (1 + l2 - l1), min=-1, max=1)
+            nu = torch.clamp(nu - delta / df, max=x_ij * s2_ - 0.01)
+            k2 = s2_ / (s2_ * x_ij + 1 - nu)
+            T_ = xlog - torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
+            f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
+            df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
+            nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
+
+        k2 = s2_ / (s2_ * x_ij + 1 - nu)
+
+        def log_Px(mu, nu, k2, x_ij):
+            T = torch.logsumexp(mu + nu + 0.5 * k2, dim=-1)
+            return (
+                +torch.sum(x_ij * (mu + nu), dim=-1)
+                - torch.sum(x_ij, dim=-1) * T
+                - torch.lgamma(x_ij + 1).sum(dim=-1)
+                + torch.lgamma(x_ij.sum(dim=-1) + 1)
+            )
+
+        def log_Pz(s2, nu, k2):
+            return (
+                -0.5 * torch.log(s2)
+                - 0.9189385  # log(sqrt(2pi))
+                - 0.5 * (torch.square(nu) + k2) / s2
+            )
+
+        def log_Qz(s2, nu, k2):
+            return (
+                -0.5 * torch.log(k2)
+                - 0.9189385  # log(sqrt(2pi))
+                - 0.5
+            )
+
+        log_px = log_Px(mu, nu, k2, x_ij)
+        log_pz = log_Pz(s2, nu, k2)
+        log_qz = log_Qz(s2, nu, k2)
+
+        with pyro.plate("Gxncells", G):
+            pyro.factor("z_i", (log_pz - log_qz).transpose(-1, -2))
+
+        pyro.factor("x_i", log_px.unsqueeze(-2))
+
+        return x_ij
 
     #  ==  model description == #
     def model(self, idx=None):
@@ -510,15 +649,17 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(base): (P) 1 x G | C
             base = self.output_base(global_base, scale_tril)
 
-            # TODO: give a proper name to this variable and
-            # describe the prior.
-            the_scale = pyro.sample(
-                name="the_scale",
-                # dim(the_scale): (P) x 1 x G
-                fn=dist.Exponential(6.0 * torch.ones(1, 1).to(self.device)),
-            )
-            # dim(the_scale): (P) x G x 1
-            the_scale = the_scale.transpose(-1, -2)
+            # The variable `scale_z` describes how fuzzy every gene
+            # is. It is the scale factor of the variable `z_i` that
+            # is either sampled or marginalized. The distribution
+            # is exponential with a 1% chance that the value is
+            # above 0.65, meaning that 1% of the genes are expected
+            # to vary by a factor 7, everything held constant. In
+            # the same way, 0.1% of the genes are expected to vary
+            # by a factor 20, everything held constant.
+
+            # dim(scale_z): (P) x G x 1
+            scale_z = self.output_scale_z()
 
             # Per-batch, per-gene sampling.
             with pyro.plate("BxG", B, dim=-2):
@@ -569,44 +710,49 @@ class Cellavi(pyro.nn.PyroModule):
             base_i = self.collect_base_i(one_hot_c_indx, base)
 
             # dim(batch_fx_i): (P) x ncells x G
-            batch_fx_i = self.collect_batch_fx_i(batch, batch_fx, indx_i, base.dtype)
+            batch_fx_i = self.collect_batch_fx_i(batch, batch_fx, indx_i)
 
-            # Expected expression of gene in log space (logits).
+            # dim(moduls_i): (P) x ncells x G
+            moduls_i = self.collect_moduls_i(group, theta_i, moduls, indx_i)
+
+            # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
-            mu_i = base_i + batch_fx_i
+            mu_i = base_i + batch_fx_i + moduls_i
 
-            with pyro.plate("Gxncells", G):
-                z_i = pyro.sample(
-                    name="z_i",
-                    # dim(z_i): (P) x G x ncells
-                    fn=dist.Normal(
-                        loc=torch.zeros(1, 1).to(self.device),
-                        scale=the_scale,
+            if self.marginalize:
+                x = self.compute_ELBO_z_i(x_i, mu_i, scale_z, indx_i)
+                return x
+
+            else:
+                with pyro.plate("Gxncells", G):
+                    z_i = pyro.sample(
+                        name="z_i",
+                        # dim(z_i): (P) x G x ncells
+                        fn=dist.Normal(
+                            loc=torch.zeros(1, 1).to(self.device),
+                            scale=scale_z,
+                        ),
+                    )
+
+                # dim(z_i): (P) x ncells x G
+                z_i = z_i.transpose(-1, -2)
+
+                # dim(probs_i): (P) x ncells x G
+                probs_i = torch.softmax(mu_i + z_i, dim=-1)
+                # dim(probs_i): (P) x 1 x ncells x G
+                probs_i = probs_i.unsqueeze(-3)
+
+                x = pyro.sample(
+                    name="x_i",
+                    # dim(x_i): (P) x 1 x ncells | G
+                    fn=dist.Multinomial(
+                        probs=probs_i,
+                        validate_args=False,
                     ),
+                    obs=x_i,
                 )
 
-            # dim(z_i): (P) x ncells x G
-            z_i = z_i.transpose(-1, -2)
-            # dim(base_prob): (P) x ncells x G
-            mu_i_plus_z_i = mu_i + z_i
-
-            # dim(probs_i): (P) x 1 x ncells x G
-            probs_i = self.collect_probs_i(group, theta_i, mu_i_plus_z_i, moduls, indx_i)
-
-            # dim(rate_i): (P) x 1 x ncells x G
-            rate_i = probs_i * x_i.sum(dim=-1, keepdim=True)
-
-            x = pyro.sample(
-                name="x_i",
-                # dim(x_i): (P) x 1 x ncells | G
-                fn=dist.Poisson(
-                    rate=rate_i,
-                    validate_args=False,
-                ).to_event(1),
-                obs=x_i,
-            )
-
-            return x
+                return x
 
     def guide(self, idx=None):
         # Sample all non-cell variables.
@@ -633,15 +779,16 @@ class Cellavi(pyro.nn.PyroModule):
                 )
                 log_theta_i.shape
 
-            with pyro.plate("Gxncells", G):
-                pyro.sample(
-                    name="z_i",
-                    # dim(z_i): (P) x G x ncells
-                    fn=dist.Normal(
-                        loc=self.z_i_loc,
-                        scale=self.z_i_scale,
-                    ),
-                )
+            if self.marginalize is False:
+                with pyro.plate("Gxncells", G):
+                    pyro.sample(
+                        name="z_i",
+                        # dim(z_i): (P) x G x ncells
+                        fn=dist.Normal(
+                            loc=self.z_i_loc,
+                            scale=self.z_i_scale,
+                        ),
+                    )
 
             # If some cell types are unknown, sample them here.
             if self.need_to_infer_cell_type:
@@ -703,16 +850,17 @@ if __name__ == "__main__":
     validate(data)
 
     pyro.clear_param_store()
-    cellavi = Cellavi(data)
+    cellavi = Cellavi(data, marginalize=True)
 
-    # TODO: improve this bit.
+    # TODO: improve the bit about prediction.
     if len(sys.argv) > 5:
         # Prediction.
         store = torch.load(sys.argv[5])
         for key in store["params"]:
             store["params"][key] = store["params"][key].to(device)
         pyro.get_param_store().set_state(store)
-        sample = cellavi.predict()
+        sample = cellavi.predict().cpu()
+        torch.save(sample, out_path)
     else:
         # Fitting.
         data_loader = torch.utils.data.DataLoader(
@@ -728,7 +876,7 @@ if __name__ == "__main__":
             strategy=pl.strategies.DeepSpeedStrategy(stage=2),
             accelerator="gpu",
             gradient_clip_val=1.0,
-            max_epochs=NUM_EPOCHS,
+            max_epochs=harnessed.compute_num_training_epochs(),
             enable_progress_bar=True,
             enable_model_summary=True,
             logger=pl.loggers.CSVLogger("."),
