@@ -1,3 +1,4 @@
+import math
 import sys
 
 import lightning.pytorch as pl
@@ -26,6 +27,7 @@ NUM_PARTICLES = 12
 MIN_NUM_GLOBAL_UPDATES = 2048
 MIN_NUM_CELL_UPDATES = 24
 
+DEBUG_COUNTER = 0
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
@@ -154,6 +156,7 @@ class plTrainHarness(pl.LightningModule):
         (lr,) = self.lr_schedulers().get_last_lr()
         info = {"loss": loss, "lr": lr}
         self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
+        self.cellavi.training_steps_performed = self.trainer.global_step
         return loss
 
     def compute_num_training_epochs(self):
@@ -191,6 +194,7 @@ class Cellavi(pyro.nn.PyroModule):
         self.bsz = self.ncells if self.ncells < SUBSMPL else SUBSMPL
 
         self.marginalize = marginalize
+        self.training_steps_performed = 0
 
         # 1a) Define core parts of the model.
         self.output_scale_tril_unit = self.sample_scale_tril_unit
@@ -485,31 +489,23 @@ class Cellavi(pyro.nn.PyroModule):
         moduls_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, moduls, ohg)
         return moduls_i
 
-    def compute_ELBO_z_i(self, x_ij, mu, sg, idx):
-        # Parameters `mu` and `sg` are the prior parameters of the Poisson
-        # LogNormal distribution. The variational posterior parameters
-        # given the observations `x_ij` are `xi` and `w2_i`. In this case
-        # we can compute the ELBO analytically and maximize it with respect
-        # to `xi` and `w2_i` so as to pass the gradient to `mu` and `sg`.
-        # This allows us to compute the ELBO efficiently without having
-        # to store parameters and gradients for `xi` and `w2_i`.
-
+    def compute_nu_and_k2(self, x_ij, mu, sg, idx):
         # dim(sg): (P) x 1 x G
         sg = sg.transpose(-1, -2)
         s2 = torch.square(sg)
 
-        #        log_P = math.log(mu[None].shape[-3])
-        #        if self.need_to_infer_cell_type:
-        #            self._pyro_context.active += 1
-        #            # dim(c_indx_probs): ncells x 1 x C
-        #            c_indx_probs = self.c_indx_probs.detach()
-        #            self._pyro_context.active -= 1
-        #            # dim(log_probs): C x ncells x 1
-        #            log_probs = c_indx_probs.detach().permute(2, 0, 1).log()
-        #            # dim(log_probs): C x 1 x 1 x ncells x 1
-        #            log_probs = log_probs.unsqueeze(-3).unsqueeze(-3)
-        #        else:
-        #            log_probs = 0.
+        #       log_P = math.log(mu[None].shape[-3])
+        #       if self.need_to_infer_cell_type:
+        #           self._pyro_context.active += 1
+        #           # dim(c_indx_probs): ncells x 1 x C
+        #           c_indx_probs = self.c_indx_probs.detach()
+        #           self._pyro_context.active -= 1
+        #           # dim(log_probs): C x ncells x 1
+        #           log_probs = c_indx_probs.detach().permute(2, 0, 1).log()
+        #           # dim(log_probs): C x 1 x 1 x ncells x 1
+        #           log_probs = log_probs.unsqueeze(-3).unsqueeze(-3)
+        #       else:
+        #           log_probs = 0.
 
         # No gradient.
         # dim(mu_): ncells x G
@@ -517,16 +513,16 @@ class Cellavi(pyro.nn.PyroModule):
         s2_ = 1.0 / (1.0 / s2[None].detach()).mean(dim=-3)
 
         xlog = x_ij.sum(dim=-1, keepdim=True).log()
+        nu = -0.5 * torch.ones_like(mu_)
 
         T_ = xlog - torch.logsumexp(mu_, dim=-1, keepdim=True)
-        nu = -0.5 * torch.ones_like(mu_)
         for _ in range(4):
             k2 = s2_ / (s2_ * x_ij + 1 - nu)
             f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
             df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
             nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
 
-        for _ in range(12):
+        for _ in range(5):
             nu__ = torch.clamp(nu - 1.0 / df, max=x_ij * s2_ - 0.01)
             k2__ = s2_ / (s2_ * x_ij + 1 - nu__)
             l1 = torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
@@ -540,6 +536,75 @@ class Cellavi(pyro.nn.PyroModule):
             nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
 
         k2 = s2_ / (s2_ * x_ij + 1 - nu)
+
+        # Scale estimates over training steps.
+        t = 1.0 - math.exp(-2 * (3 * self.training_steps_performed / MIN_NUM_GLOBAL_UPDATES) ** 2)
+        nu = (0.7 + 0.3 * t) * nu
+        k2 = (0.7 + 0.3 * t) * k2 + (0.3 - 0.3 * t) * torch.ones_like(k2)
+
+        return nu, k2
+
+    def compute_ELBO_z_i(self, x_ij, mu, sg, idx):
+        # Parameters `mu` and `sg` are the prior parameters of the Poisson
+        # LogNormal distribution. The variational posterior parameters
+        # given the observations `x_ij` are `xi` and `w2_i`. In this case
+        # we can compute the ELBO analytically and maximize it with respect
+        # to `xi` and `w2_i` so as to pass the gradient to `mu` and `sg`.
+        # This allows us to compute the ELBO efficiently without having
+        # to store parameters and gradients for `xi` and `w2_i`.
+
+        # dim(sg): (P) x 1 x G
+        sg = sg.transpose(-1, -2)
+        s2 = torch.square(sg)
+
+        #       log_P = math.log(mu[None].shape[-3])
+        #       if self.need_to_infer_cell_type:
+        #           self._pyro_context.active += 1
+        #           # dim(c_indx_probs): ncells x 1 x C
+        #           c_indx_probs = self.c_indx_probs.detach()
+        #           self._pyro_context.active -= 1
+        #           # dim(log_probs): C x ncells x 1
+        #           log_probs = c_indx_probs.detach().permute(2, 0, 1).log()
+        #           # dim(log_probs): C x 1 x 1 x ncells x 1
+        #           log_probs = log_probs.unsqueeze(-3).unsqueeze(-3)
+        #       else:
+        #           log_probs = 0.
+
+        # No gradient.
+        # dim(mu_): ncells x G
+        mu_ = mu[None].mean(dim=-3).detach()
+        s2_ = 1.0 / (1.0 / s2[None].detach()).mean(dim=-3)
+
+        xlog = x_ij.sum(dim=-1, keepdim=True).log()
+        nu = -0.5 * torch.ones_like(mu_)
+
+        global DEBUG_COUNTER
+        DEBUG_COUNTER += 1
+        if DEBUG_COUNTER < 1024:
+            nu = torch.zeros_like(nu)
+            k2 = torch.ones_like(nu)
+        else:
+            T_ = xlog - torch.logsumexp(mu_, dim=-1, keepdim=True)
+            for _ in range(4):
+                k2 = s2_ / (s2_ * x_ij + 1 - nu)
+                f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
+                df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
+                nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
+
+            for _ in range(5):
+                nu__ = torch.clamp(nu - 1.0 / df, max=x_ij * s2_ - 0.01)
+                k2__ = s2_ / (s2_ * x_ij + 1 - nu__)
+                l1 = torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
+                l2 = torch.logsumexp(mu_ + nu__ + 0.5 * k2__, dim=-1, keepdim=True)
+                delta = torch.clamp(-(T_ - xlog + l1) / (1 + l2 - l1), min=-1, max=1)
+                nu = torch.clamp(nu - delta / df, max=x_ij * s2_ - 0.01)
+                k2 = s2_ / (s2_ * x_ij + 1 - nu)
+                T_ = xlog - torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
+                f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
+                df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
+                nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
+
+            k2 = s2_ / (s2_ * x_ij + 1 - nu)
 
         def log_Px(mu, nu, k2, x_ij):
             T = torch.logsumexp(mu + nu + 0.5 * k2, dim=-1)
@@ -720,10 +785,48 @@ class Cellavi(pyro.nn.PyroModule):
             mu_i = base_i + batch_fx_i + moduls_i
 
             if self.marginalize:
-                x = self.compute_ELBO_z_i(x_i, mu_i, scale_z, indx_i)
-                return x
+                #                self.compute_ELBO_z_i(x_i, mu_i, scale_z, indx_i)
+
+                # Marginalize "z_i". Optimize the variational
+                # parameters explicitly and add terms to the ELBO.
+
+                nu, k2 = self.compute_nu_and_k2(x_i, mu_i, scale_z, indx_i)
+
+                def log_Px(mu, nu, k2, x_i):
+                    T = torch.logsumexp(mu + nu + 0.5 * k2, dim=-1)
+                    return (
+                        +torch.sum(x_i * (mu + nu), dim=-1)
+                        - torch.sum(x_i, dim=-1) * T
+                        - torch.lgamma(x_i + 1).sum(dim=-1)
+                        + torch.lgamma(x_i.sum(dim=-1) + 1)
+                    )
+
+                def log_Pz(s2, nu, k2):
+                    return (
+                        -0.5 * torch.log(s2)
+                        - 0.9189385  # log(sqrt(2pi))
+                        - 0.5 * (torch.square(nu) + k2) / s2
+                    )
+
+                def log_Qz(s2, nu, k2):
+                    return (
+                        -0.5 * torch.log(k2)
+                        - 0.9189385  # log(sqrt(2pi))
+                        - 0.5
+                    )
+
+                log_px = log_Px(mu_i, nu, k2, x_i)
+                log_pz = log_Pz(torch.square(scale_z.transpose(-1, -2)), nu, k2)
+                log_qz = log_Qz(torch.square(scale_z.transpose(-1, -2)), nu, k2)
+
+                with pyro.plate("Gxncells", G):
+                    pyro.factor("z_i", (log_pz - log_qz).transpose(-1, -2))
+
+                pyro.factor("x_i", log_px.unsqueeze(-2))
 
             else:
+                # Do not marginalize "z_i". Sample it as a Normal
+                # variable as usual.
                 with pyro.plate("Gxncells", G):
                     z_i = pyro.sample(
                         name="z_i",
@@ -742,7 +845,7 @@ class Cellavi(pyro.nn.PyroModule):
                 # dim(probs_i): (P) x 1 x ncells x G
                 probs_i = probs_i.unsqueeze(-3)
 
-                x = pyro.sample(
+                pyro.sample(
                     name="x_i",
                     # dim(x_i): (P) x 1 x ncells | G
                     fn=dist.Multinomial(
@@ -752,8 +855,7 @@ class Cellavi(pyro.nn.PyroModule):
                     obs=x_i,
                 )
 
-                return x
-
+    #  ==  guide description == #
     def guide(self, idx=None):
         # Sample all non-cell variables.
         self.autonormal(idx)
