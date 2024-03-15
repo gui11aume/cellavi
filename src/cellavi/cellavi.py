@@ -27,7 +27,6 @@ NUM_PARTICLES = 12
 MIN_NUM_GLOBAL_UPDATES = 2048
 MIN_NUM_CELL_UPDATES = 24
 
-DEBUG_COUNTER = 0
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
@@ -402,7 +401,7 @@ class Cellavi(pyro.nn.PyroModule):
         scale_z = pyro.sample(
             name="scale_z",
             # dim(scale_z): (P) x 1 x G
-            fn=dist.Exponential(7.0 * torch.ones(1, 1).to(self.device)),
+            fn=dist.Exponential(4.0 * torch.ones(1, 1).to(self.device)),
         )
         # dim(scale_z): (P) x G x 1
         scale_z = scale_z.transpose(-1, -2)
@@ -523,122 +522,26 @@ class Cellavi(pyro.nn.PyroModule):
             nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
 
         for _ in range(5):
-            nu__ = torch.clamp(nu - 1.0 / df, max=x_ij * s2_ - 0.01)
+            nu__ = torch.clamp(nu - 1.0 / df, max=x_ij * s2_ - 0.001)
             k2__ = s2_ / (s2_ * x_ij + 1 - nu__)
             l1 = torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
             l2 = torch.logsumexp(mu_ + nu__ + 0.5 * k2__, dim=-1, keepdim=True)
             delta = torch.clamp(-(T_ - xlog + l1) / (1 + l2 - l1), min=-1, max=1)
-            nu = torch.clamp(nu - delta / df, max=x_ij * s2_ - 0.01)
+            nu = torch.clamp(nu - delta / df, max=x_ij * s2_ - 0.001)
             k2 = s2_ / (s2_ * x_ij + 1 - nu)
             T_ = xlog - torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
             f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
             df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
-            nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
+            nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.001)
 
         k2 = s2_ / (s2_ * x_ij + 1 - nu)
 
         # Scale estimates over training steps.
         t = 1.0 - math.exp(-2 * (3 * self.training_steps_performed / MIN_NUM_GLOBAL_UPDATES) ** 2)
-        nu = (0.7 + 0.3 * t) * nu
-        k2 = (0.7 + 0.3 * t) * k2 + (0.3 - 0.3 * t) * torch.ones_like(k2)
+        nu = (0.1 + 0.9 * t) * nu
+        k2 = (0.1 + 0.9 * t) * k2 + (0.9 - 0.9 * t) * torch.ones_like(k2)
 
         return nu, k2
-
-    def compute_ELBO_z_i(self, x_ij, mu, sg, idx):
-        # Parameters `mu` and `sg` are the prior parameters of the Poisson
-        # LogNormal distribution. The variational posterior parameters
-        # given the observations `x_ij` are `xi` and `w2_i`. In this case
-        # we can compute the ELBO analytically and maximize it with respect
-        # to `xi` and `w2_i` so as to pass the gradient to `mu` and `sg`.
-        # This allows us to compute the ELBO efficiently without having
-        # to store parameters and gradients for `xi` and `w2_i`.
-
-        # dim(sg): (P) x 1 x G
-        sg = sg.transpose(-1, -2)
-        s2 = torch.square(sg)
-
-        #       log_P = math.log(mu[None].shape[-3])
-        #       if self.need_to_infer_cell_type:
-        #           self._pyro_context.active += 1
-        #           # dim(c_indx_probs): ncells x 1 x C
-        #           c_indx_probs = self.c_indx_probs.detach()
-        #           self._pyro_context.active -= 1
-        #           # dim(log_probs): C x ncells x 1
-        #           log_probs = c_indx_probs.detach().permute(2, 0, 1).log()
-        #           # dim(log_probs): C x 1 x 1 x ncells x 1
-        #           log_probs = log_probs.unsqueeze(-3).unsqueeze(-3)
-        #       else:
-        #           log_probs = 0.
-
-        # No gradient.
-        # dim(mu_): ncells x G
-        mu_ = mu[None].mean(dim=-3).detach()
-        s2_ = 1.0 / (1.0 / s2[None].detach()).mean(dim=-3)
-
-        xlog = x_ij.sum(dim=-1, keepdim=True).log()
-        nu = -0.5 * torch.ones_like(mu_)
-
-        global DEBUG_COUNTER
-        DEBUG_COUNTER += 1
-        if DEBUG_COUNTER < 1024:
-            nu = torch.zeros_like(nu)
-            k2 = torch.ones_like(nu)
-        else:
-            T_ = xlog - torch.logsumexp(mu_, dim=-1, keepdim=True)
-            for _ in range(4):
-                k2 = s2_ / (s2_ * x_ij + 1 - nu)
-                f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
-                df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
-                nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
-
-            for _ in range(5):
-                nu__ = torch.clamp(nu - 1.0 / df, max=x_ij * s2_ - 0.01)
-                k2__ = s2_ / (s2_ * x_ij + 1 - nu__)
-                l1 = torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
-                l2 = torch.logsumexp(mu_ + nu__ + 0.5 * k2__, dim=-1, keepdim=True)
-                delta = torch.clamp(-(T_ - xlog + l1) / (1 + l2 - l1), min=-1, max=1)
-                nu = torch.clamp(nu - delta / df, max=x_ij * s2_ - 0.01)
-                k2 = s2_ / (s2_ * x_ij + 1 - nu)
-                T_ = xlog - torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
-                f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
-                df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
-                nu = torch.clamp(nu - f / df, max=x_ij * s2_ - 0.01)
-
-            k2 = s2_ / (s2_ * x_ij + 1 - nu)
-
-        def log_Px(mu, nu, k2, x_ij):
-            T = torch.logsumexp(mu + nu + 0.5 * k2, dim=-1)
-            return (
-                +torch.sum(x_ij * (mu + nu), dim=-1)
-                - torch.sum(x_ij, dim=-1) * T
-                - torch.lgamma(x_ij + 1).sum(dim=-1)
-                + torch.lgamma(x_ij.sum(dim=-1) + 1)
-            )
-
-        def log_Pz(s2, nu, k2):
-            return (
-                -0.5 * torch.log(s2)
-                - 0.9189385  # log(sqrt(2pi))
-                - 0.5 * (torch.square(nu) + k2) / s2
-            )
-
-        def log_Qz(s2, nu, k2):
-            return (
-                -0.5 * torch.log(k2)
-                - 0.9189385  # log(sqrt(2pi))
-                - 0.5
-            )
-
-        log_px = log_Px(mu, nu, k2, x_ij)
-        log_pz = log_Pz(s2, nu, k2)
-        log_qz = log_Qz(s2, nu, k2)
-
-        with pyro.plate("Gxncells", G):
-            pyro.factor("z_i", (log_pz - log_qz).transpose(-1, -2))
-
-        pyro.factor("x_i", log_px.unsqueeze(-2))
-
-        return x_ij
 
     #  ==  model description == #
     def model(self, idx=None):
@@ -718,10 +621,8 @@ class Cellavi(pyro.nn.PyroModule):
             # is. It is the scale factor of the variable `z_i` that
             # is either sampled or marginalized. The distribution
             # is exponential with a 1% chance that the value is
-            # above 0.65, meaning that 1% of the genes are expected
-            # to vary by a factor 7, everything held constant. In
-            # the same way, 0.1% of the genes are expected to vary
-            # by a factor 20, everything held constant.
+            # above 1.15, meaning that 1% of the genes are expected
+            # to vary by a factor 30, everything held constant.
 
             # dim(scale_z): (P) x G x 1
             scale_z = self.output_scale_z()
@@ -785,11 +686,8 @@ class Cellavi(pyro.nn.PyroModule):
             mu_i = base_i + batch_fx_i + moduls_i
 
             if self.marginalize:
-                #                self.compute_ELBO_z_i(x_i, mu_i, scale_z, indx_i)
-
                 # Marginalize "z_i". Optimize the variational
                 # parameters explicitly and add terms to the ELBO.
-
                 nu, k2 = self.compute_nu_and_k2(x_i, mu_i, scale_z, indx_i)
 
                 def log_Px(mu, nu, k2, x_i):
