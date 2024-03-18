@@ -318,17 +318,33 @@ class Cellavi(pyro.nn.PyroModule):
         )
 
     #  == Predict ==  #
-    def predict(self, num_samples=200, resample_PLN=True):
-        hide = ["z_i"] if resample_PLN else []
-        guide = pyro.plate("samples", 10, dim=-3)(pyro.poutine.block(self.guide, hide=hide))
-        model = pyro.plate("samples", 10, dim=-3)(self.model)
+    def predict(self, num_samples=200, sample_z_from_posterior=False):
+        self.marginalize = False
+        if sample_z_from_posterior:
+            use_prior = []
+            assert hasattr(self, "z_i_loc")
+            assert hasattr(self, "z_i_scale")
+        else:
+            use_prior = ["z_i"]
+            self.z_i_loc = torch.zeros(1, 1).to(self.device)
+            self.z_i_scale = torch.ones(1, 1).to(self.device)
+        guide = pyro.plate("samples", 10, dim=-3)(pyro.poutine.block(self.guide, hide=use_prior))
+        model = pyro.plate("samples", 10, dim=-3)(pyro.poutine.block(self.model, hide=["x_i"]))
         samples = list()
+        total_counts = [int(x) for x in self.X.sum(dim=-1)]
         with UnconditionMessenger(sites=["x_i"]), torch.no_grad():
+            # Generate 10 sample at a time.
             for _ in range(0, num_samples, 10):
                 guide_trace = pyro.poutine.trace(guide).get_trace()
                 model_trace = pyro.poutine.trace(pyro.poutine.replay(model, guide_trace)).get_trace()
-                samples.append(model_trace.nodes["x_i"]["value"])
-            sample = torch.cat(samples, dim=0).squeeze()
+                z_i = model_trace.nodes["z_i"]["value"]
+
+                def multi(c):
+                    return torch.distributions.Multinomial(total_counts[c], logits=z_i[..., c])
+
+                x_i = torch.stack([multi(c).sample() for c in range(self.ncells)])
+                samples.append(x_i.transpose(0, 1))
+            sample = torch.cat(samples, dim=0)
         return sample
 
     #  == Helper functions ==  #

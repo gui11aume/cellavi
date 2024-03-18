@@ -190,11 +190,18 @@ class prodLDA(pyro.nn.PyroModule):
         guide = pyro.plate("samples", 10, dim=-3)(self.guide)
         model = pyro.plate("samples", 10, dim=-3)(self.model)
         samples = list()
+        total_counts = [int(x) for x in self.X.sum(dim=-1)]
         with torch.no_grad():
             for _ in range(0, num_samples, 10):
                 guide_trace = pyro.poutine.trace(guide).get_trace()
                 model_trace = pyro.poutine.trace(pyro.poutine.replay(model, guide_trace)).get_trace()
-                samples.append(model_trace.nodes["probs_i"]["value"])
+                probs_i = model_trace.nodes["probs_i"]["value"]
+
+                def multi(c):
+                    return torch.distributions.Multinomial(total_counts[c], probs=probs_i[:, c, :])
+
+                x_i = torch.stack([multi(c).sample() for c in range(self.ncells)])
+                samples.append(x_i.transpose(0, 1))
             sample = torch.cat(samples, dim=0).squeeze()
         return sample
 
@@ -292,9 +299,12 @@ class prodLDA(pyro.nn.PyroModule):
         self.autonormal(idx)
 
         # Per-cell sampling
-        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device):
+        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
             # TODO: find canonical way to enter context of the module.
             self._pyro_context.active += 1
+
+            # Subset data and mask.
+            subset(self.cmask, indx_i)
 
             # If more than one unit, sample them here.
             if self.need_to_infer_moduls:
