@@ -83,15 +83,7 @@ class plTrainHarness(pl.LightningModule):
             )
 
         # Instantiate parameters of autoguides.
-        available_ctypes = torch.unique(self.cellavi.ctype[self.cellavi.cmask])
-        missing_ctypes = set(torch.arange(C).tolist()).difference(available_ctypes.tolist())
-        # Condition 1: need to infer cell types, some lables without examples.
-        condition_1 = self.cellavi.need_to_infer_cell_type and missing_ctypes
-        available_moduls = torch.unique(self.cellavi.label[self.cellavi.smask])
-        missing_moduls = set(torch.arange(K).tolist()).difference(available_moduls.tolist())
-        # Condition 2: need to infer moduls, some lables without examples.
-        condition_2 = self.cellavi.need_to_infer_moduls and missing_moduls
-        if condition_1 or condition_2:
+        if self.cellavi.need_to_infer_cell_type or self.cellavi.need_to_infer_moduls:
             self.find_initial_conditions()
 
         # Instantiate parameters of autoguides.
@@ -230,7 +222,7 @@ class Cellavi(pyro.nn.PyroModule):
             self.need_to_infer_moduls = False
             self.output_moduls = self.zero
             self.output_theta_i = self.zero
-            raise NotImplementedError
+            self.collect_moduls_i = self.zero
 
         if cmask.all() or C == 1:
             self.need_to_infer_cell_type = False
@@ -295,17 +287,19 @@ class Cellavi(pyro.nn.PyroModule):
                     # At least one example is available for every label.
                     zero = torch.zeros(C, G).to(self.device)
                     index = self.ctype[self.cmask].unsqueeze(-1).expand(self.X[self.cmask].shape)
-                    base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X[self.cmask]), "mean")
+                    base_0 = zero.scatter_reduce(
+                        0, index, torch.log(0.5 + self.X[self.cmask]), "mean", include_self=False
+                    )
                 else:
                     # Some labels have no known examples.
                     zero = torch.zeros(C, G).to(self.device)
                     index = self.ctype.unsqueeze(-1).expand(self.X.shape)
-                    base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X), "mean")
+                    base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X), "mean", include_self=False)
+                    base_0 += 0.1 * torch.randn(base_0.shape, device=self.device)
                     # Recompute label 0 plus all those that are missing.
                     available = torch.unique(self.ctype[self.cmask])
                     missing = set(torch.arange(C).tolist()).difference(available.tolist())
                     idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, len(missing)).to(self.device)
-                    base_0[list(missing)] = subset(torch.log(0.5 + self.X), idx)
                     if 0 in available:
                         base_0[0] = torch.mean(torch.log(0.5 + self.X[self.ctype == 0 & self.cmask]))
             else:
@@ -493,22 +487,23 @@ class Cellavi(pyro.nn.PyroModule):
         sg = sg.transpose(-1, -2)
         s2 = torch.square(sg)
 
-        #       log_P = math.log(mu[None].shape[-3])
-        #       if self.need_to_infer_cell_type:
-        #           self._pyro_context.active += 1
-        #           # dim(c_indx_probs): ncells x 1 x C
-        #           c_indx_probs = self.c_indx_probs.detach()
-        #           self._pyro_context.active -= 1
-        #           # dim(log_probs): C x ncells x 1
-        #           log_probs = c_indx_probs.detach().permute(2, 0, 1).log()
-        #           # dim(log_probs): C x 1 x 1 x ncells x 1
-        #           log_probs = log_probs.unsqueeze(-3).unsqueeze(-3)
-        #       else:
-        #           log_probs = 0.
+        if self.need_to_infer_cell_type is False or mu.dim() == 2:
+            avmu = mu
+        else:
+            self._pyro_context.active += 1
+            # dim(c_indx_probs): ncells x 1 x C
+            c_indx_probs = self.c_indx_probs.detach()
+            self._pyro_context.active -= 1
+            # dim(avmu): (P) x ncells x G
+            if c_indx_probs.dim() > 2:
+                avmu = torch.einsum("C...nG,onC->...nG", mu, c_indx_probs)
+            else:
+                avmu = torch.einsum("C...nG,nC->...nG", mu, c_indx_probs)
 
-        # No gradient.
+        # Remove gradient for Newton-Raphson cycles.
         # dim(mu_): ncells x G
-        mu_ = mu[None].mean(dim=-3).detach()
+        mu_ = avmu[None].mean(dim=-3).detach()
+        # dim(s2_): ncells x G
         s2_ = 1.0 / (1.0 / s2[None].detach()).mean(dim=-3)
 
         xlog = x_ij.sum(dim=-1, keepdim=True).log()
