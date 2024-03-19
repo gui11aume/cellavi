@@ -82,6 +82,9 @@ class plTrainHarness(pl.LightningModule):
                 ignore_jit_warnings=True,
             )
 
+        # Initialize Cellavi autoguide.
+        self.cellavi.initialize_auto_guide()
+
         # Instantiate parameters of autoguides.
         if self.cellavi.need_to_infer_cell_type or self.cellavi.need_to_infer_moduls:
             self.find_initial_conditions()
@@ -233,10 +236,7 @@ class Cellavi(pyro.nn.PyroModule):
             self.output_c_indx = self.sample_c_indx
             self.collect_base_i = self.compute_base_i_enum
 
-        # 2) Define the autoguide.
-        self.initialize_auto_guide()
-
-        # 3) Define the guide parameters.
+        # 2) Define the guide parameters.
         if self.marginalize is False:
             self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(G, self.ncells).to(self.device), event_dim=0)
             self.z_i_scale = pyro.nn.module.PyroParam(
@@ -310,16 +310,17 @@ class Cellavi(pyro.nn.PyroModule):
             avlog = torch.log(0.5 + self.X).mean(dim=0, keepdim=True)
             return avlog - avlog.mean()
 
-    def initialize_auto_guide(self):
+    def initialize_auto_guide(self, new_params=True):
         # Reinitialize the parameters of the autoguide.
         self.autonormal = AutoNormal(
             pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"]),
-            init_loc_fn=self.init_loc_fn,
+            init_loc_fn=self.init_loc_fn if new_params else pyro.infer.autoguide.initialization.init_to_feasible,
         )
 
     #  == Predict ==  #
     def predict(self, num_samples=200, sample_z_from_posterior=False):
         self.marginalize = False
+        self.initialize_auto_guide(new_params=False)
         if sample_z_from_posterior:
             use_prior = []
             assert hasattr(self, "z_i_loc")
@@ -337,10 +338,10 @@ class Cellavi(pyro.nn.PyroModule):
             for _ in range(0, num_samples, 10):
                 guide_trace = pyro.poutine.trace(guide).get_trace()
                 model_trace = pyro.poutine.trace(pyro.poutine.replay(model, guide_trace)).get_trace()
-                z_i = model_trace.nodes["z_i"]["value"]
+                probs_i = model_trace.nodes["probs_i"]["value"]
 
                 def multi(c):
-                    return torch.distributions.Multinomial(total_counts[c], logits=z_i[..., c])
+                    return torch.distributions.Multinomial(total_counts[c], probs=probs_i[:, c, :])
 
                 x_i = torch.stack([multi(c).sample() for c in range(self.ncells)])
                 samples.append(x_i.transpose(0, 1))
@@ -751,6 +752,8 @@ class Cellavi(pyro.nn.PyroModule):
 
                 # dim(probs_i): (P) x ncells x G
                 probs_i = torch.softmax(mu_i + z_i, dim=-1)
+                # Register `probs_i` for prediction purposes.
+                pyro.deterministic("probs_i", probs_i)
                 # dim(probs_i): (P) x 1 x ncells x G
                 probs_i = probs_i.unsqueeze(-3)
 
