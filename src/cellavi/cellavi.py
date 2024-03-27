@@ -1,24 +1,23 @@
 import math
-import sys
 
 import lightning.pytorch as pl
 import pyro
 import pyro.distributions as dist
 import torch
 import torch.nn.functional as F
-from misc_cellavi import (
-    read_dense_matrix,
-    read_info_from_file,
-)
-from pyro.infer.autoguide import (
-    AutoNormal,
-)
+from pyro.infer.autoguide import AutoNormal
 
-global K  # Number of moduls / set by user.
-global B  # Number of batches / from data.
-global C  # Number of types / from data.
-global R  # Number of groups / from data.
-global G  # Number of genes / from data.
+global K  # Number of moduls
+global B  # Number of batches
+global C  # Number of types
+global R  # Number of groups
+global G  # Number of genes
+
+K: int = -1
+B: int = -1
+C: int = -1
+R: int = -1
+G: int = -1
 
 
 DEBUG = False
@@ -32,7 +31,7 @@ MIN_NUM_CELL_UPDATES = 24
 pyro.enable_validation(DEBUG)
 
 
-def subset(tensor, idx):
+def subset(tensor: torch.tensor, idx: torch.tensor) -> torch.tensor:
     if idx is None:
         return tensor
     if tensor is None:
@@ -82,9 +81,6 @@ class plTrainHarness(pl.LightningModule):
                 ignore_jit_warnings=True,
             )
 
-        # Initialize Cellavi autoguide.
-        self.cellavi.initialize_auto_guide()
-
         # Instantiate parameters of autoguides.
         if self.cellavi.need_to_infer_cell_type or self.cellavi.need_to_infer_moduls:
             self.find_initial_conditions()
@@ -109,18 +105,23 @@ class plTrainHarness(pl.LightningModule):
         if seed is None:
             for seed in range(sweep):
                 pyro.set_rng_seed(seed)
-                self.cellavi.initialize_auto_guide()
+                self.cellavi.initialize_autoguide_params()
                 loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
                 losses.append(float(loss))
             loss, seed = min([(x, i) for (i, x) in enumerate(losses)])
         pyro.set_rng_seed(seed)
-        self.cellavi.initialize_auto_guide()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.trainer.model.parameters(),
-            lr=0.01,
-        )
+        # Optimize parameters that are not frozen.
+        def select(param_name):
+            for name in self.cellavi.frozen:
+                if name in param_name:
+                    return False
+            return True
+
+        parameters = self.trainer.model.named_parameters()
+        parameters_to_optimize = [param for (name, param) in parameters if select(name)]
+        optimizer = torch.optim.Adam(parameters_to_optimize, lr=0.01)
 
         n_steps = self.trainer.estimated_stepping_batches
         n_warmup_steps = int(0.05 * n_steps)
@@ -151,6 +152,7 @@ class plTrainHarness(pl.LightningModule):
         info = {"loss": loss, "lr": lr}
         self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
         self.cellavi.training_steps_performed = self.trainer.global_step
+        print(pyro.param("autonormal.locs.base_0"))
         return loss
 
     def compute_num_training_epochs(self):
@@ -168,7 +170,7 @@ class plTrainHarness(pl.LightningModule):
 
 
 class Cellavi(pyro.nn.PyroModule):
-    def __init__(self, data, marginalize=True):
+    def __init__(self, data, marginalize=True, freeze=set()):
         super().__init__()
 
         # Unpack data.
@@ -191,7 +193,6 @@ class Cellavi(pyro.nn.PyroModule):
         self.training_steps_performed = 0
 
         # 1a) Define core parts of the model.
-        self.output_scale_tril_unit = self.sample_scale_tril_unit
         self.output_scale_factor = self.sample_scale_factor
         self.output_global_base = self.sample_global_base
         self.output_base = self.sample_base
@@ -227,7 +228,7 @@ class Cellavi(pyro.nn.PyroModule):
             self.output_theta_i = self.zero
             self.collect_moduls_i = self.zero
 
-        if cmask.all() or C == 1:
+        if self.cmask.all() or C == 1:
             self.need_to_infer_cell_type = False
             self.output_c_indx = self.return_ctype_as_is
             self.collect_base_i = self.compute_base_i_no_enum
@@ -236,7 +237,18 @@ class Cellavi(pyro.nn.PyroModule):
             self.output_c_indx = self.sample_c_indx
             self.collect_base_i = self.compute_base_i_enum
 
-        # 2) Define the guide parameters.
+        # 2) Register frozen parameters.
+        self.frozen = freeze
+
+        # 3) Instantiate autoguide.
+        # Local variables must be hidden because they are defined in the guide.
+        local_variables = ["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"]
+        self.autonormal = AutoNormal(pyro.poutine.block(self.model, hide=local_variables))
+        # Instantiate parameters now. Note that redefining `self.autonormal`
+        # will destroy the current parameters of the autoguide.
+        self.autonormal._setup_prototype()
+
+        # 3) Define the local parameters.
         if self.marginalize is False:
             self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(G, self.ncells).to(self.device), event_dim=0)
             self.z_i_scale = pyro.nn.module.PyroParam(
@@ -275,52 +287,52 @@ class Cellavi(pyro.nn.PyroModule):
                 event_dim=1,
             )
 
-    def init_loc_fn(self, site):
-        if site["name"] == "moduls_KR":
+    def freeze(self, param):
+        self.frozen.add(param)
+
+    def unfreeze(self, param):
+        self.frozen.remove(param)
+
+    def initialize_autoguide_params(self):
+        param_store = pyro.get_param_store()
+        # Site "moduls_KR".
+        if "moduls_KR" not in self.frozen:
             idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, K * R).to(self.device)
-            rows = subset(torch.log(0.5 + self.X), idx)
-            return rows - rows.mean(dim=0, keepdim=True)
-        if site["name"] == "base_0":
-            avlog = torch.log(0.5 + self.X).mean(dim=0, keepdim=True)
+            rows = subset(torch.log(self.X + 0.5), idx)
+            param_store["autonormal.locs.moduls_KR"] = rows - rows.mean(dim=0, keepdim=True)
+        if "base_0" not in self.frozen:
+            avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
             if self.cmask.any():
                 if len(torch.unique(self.ctype[self.cmask])) == C:
                     # At least one example is available for every label.
                     zero = torch.zeros(C, G).to(self.device)
                     index = self.ctype[self.cmask].unsqueeze(-1).expand(self.X[self.cmask].shape)
                     base_0 = zero.scatter_reduce(
-                        0, index, torch.log(0.5 + self.X[self.cmask]), "mean", include_self=False
+                        0, index, torch.log(self.X[self.cmask] + 0.5), "mean", include_self=False
                     )
                 else:
                     # Some labels have no known examples.
                     zero = torch.zeros(C, G).to(self.device)
                     index = self.ctype.unsqueeze(-1).expand(self.X.shape)
-                    base_0 = zero.scatter_reduce(0, index, torch.log(0.5 + self.X), "mean", include_self=False)
+                    base_0 = zero.scatter_reduce(0, index, torch.log(self.X + 0.5), "mean", include_self=False)
                     base_0 += 0.1 * torch.randn(base_0.shape, device=self.device)
                     # Recompute label 0 plus all those that are missing.
                     available = torch.unique(self.ctype[self.cmask])
                     missing = set(torch.arange(C).tolist()).difference(available.tolist())
                     idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, len(missing)).to(self.device)
                     if 0 in available:
-                        base_0[0] = torch.mean(torch.log(0.5 + self.X[self.ctype == 0 & self.cmask]))
+                        base_0[0] = torch.mean(torch.log(self.X[self.ctype == 0 & self.cmask] + 0.5))
             else:
                 idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, C).to(self.device)
-                base_0 = subset(torch.log(0.5 + self.X), idx)
-            return (base_0 - avlog).transpose(-1, -2)
-        if site["name"] == "global_base":
-            avlog = torch.log(0.5 + self.X).mean(dim=0, keepdim=True)
-            return avlog - avlog.mean()
+                base_0 = subset(torch.log(self.X + 0.5), idx)
+            param_store["autonormal.locs.base_0"] = (base_0 - avlog).transpose(-1, -2)
+        if "global_base" not in self.frozen:
+            avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
+            param_store["autonormal.locs.global_base"] = avlog - avlog.mean()
 
-    def initialize_auto_guide(self, new_params=True):
-        # Reinitialize the parameters of the autoguide.
-        self.autonormal = AutoNormal(
-            pyro.poutine.block(self.model, hide=["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"]),
-            init_loc_fn=self.init_loc_fn if new_params else pyro.infer.autoguide.initialization.init_to_feasible,
-        )
-
-    #  == Predict ==  #
-    def predict(self, num_samples=200, sample_z_from_posterior=False):
+    #  == Resample ==  #
+    def resample(self, num_samples=200, sample_z_from_posterior=False):
         self.marginalize = False
-        self.initialize_auto_guide(new_params=False)
         if sample_z_from_posterior:
             use_prior = []
             assert hasattr(self, "z_i_loc")
@@ -688,10 +700,10 @@ class Cellavi(pyro.nn.PyroModule):
             base_i = self.collect_base_i(one_hot_c_indx, base)
 
             # dim(batch_fx_i): (P) x ncells x G
-            batch_fx_i = self.collect_batch_fx_i(batch, batch_fx, indx_i)
+            batch_fx_i = self.collect_batch_fx_i(self.batch, batch_fx, indx_i)
 
             # dim(moduls_i): (P) x ncells x G
-            moduls_i = self.collect_moduls_i(group, theta_i, moduls, indx_i)
+            moduls_i = self.collect_moduls_i(self.group, theta_i, moduls, indx_i)
 
             # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
@@ -817,90 +829,3 @@ class Cellavi(pyro.nn.PyroModule):
                     )
 
             self._pyro_context.active -= 1
-
-
-def validate(data):
-    (ctype, batch, group, modul, X, (cmask, smask)) = data
-    ncells = X.shape[0]
-    assert len(ctype) == ncells
-    assert len(batch) == ncells
-    assert len(group) == ncells
-    assert len(modul) == ncells
-    assert len(cmask) == ncells
-    assert len(smask) == ncells
-
-
-if __name__ == "__main__":
-    pl.seed_everything(123)
-    torch.set_float32_matmul_precision("high")
-
-    device = "cuda"
-
-    K = int(sys.argv[1])
-    info_path = sys.argv[2]
-    expr_path = sys.argv[3]
-    out_path = sys.argv[4]
-
-    info = read_info_from_file(info_path)
-
-    ctype = info[0].to(device)
-    batch = info[1].to(device)
-    group = info[2].to(device)
-    modul = info[3].to(device)
-    cmask = info[4].to(device)
-    smask = info[5].to(device)
-
-    X = read_dense_matrix(expr_path)
-    X = X.to(device)
-
-    # Set the dimensions.
-    B = int(batch.max() + 1)
-    C = int(ctype.max() + 1)
-    R = int(group.max() + 1)
-    G = int(X.shape[-1])
-
-    data = (ctype, batch, group, modul, X, (cmask, smask))
-    data_idx = range(X.shape[0])
-    validate(data)
-
-    pyro.clear_param_store()
-    cellavi = Cellavi(data, marginalize=True)
-
-    # TODO: improve the bit about prediction.
-    if len(sys.argv) > 5:
-        # Prediction.
-        store = torch.load(sys.argv[5])
-        for key in store["params"]:
-            store["params"][key] = store["params"][key].to(device)
-        pyro.get_param_store().set_state(store)
-        sample = cellavi.predict().cpu()
-        torch.save(sample, out_path)
-    else:
-        # Fitting.
-        data_loader = torch.utils.data.DataLoader(
-            dataset=data_idx,
-            shuffle=True,
-            batch_size=SUBSMPL,
-        )
-
-        harnessed = plTrainHarness(cellavi)
-
-        trainer = pl.Trainer(
-            default_root_dir=".",
-            strategy=pl.strategies.DeepSpeedStrategy(stage=2),
-            accelerator="gpu",
-            gradient_clip_val=1.0,
-            max_epochs=harnessed.compute_num_training_epochs(),
-            enable_progress_bar=True,
-            enable_model_summary=True,
-            logger=pl.loggers.CSVLogger("."),
-            enable_checkpointing=False,
-        )
-
-        trainer.fit(harnessed, data_loader)
-
-        # Save output to file.
-        param_store = pyro.get_param_store().get_state()
-        for key, value in param_store["params"].items():
-            param_store["params"][key] = value.clone().cpu()
-        torch.save(param_store, out_path)

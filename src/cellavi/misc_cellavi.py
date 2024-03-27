@@ -1,7 +1,46 @@
 import re
 import sys
+from typing import Any, Dict, List, Tuple
 
+import pyro
 import torch
+
+
+def load_parameters(path: str, device: str, remove_locals: bool = True) -> List[str]:
+    loaded_store: Dict[Any] = torch.load(path)
+    ctmap: List[str] = loaded_store.pop("ctmap")
+    for key in loaded_store["params"]:
+        loaded_store["params"][key] = loaded_store["params"][key].to(device)
+    pyro.get_param_store().set_state(loaded_store)
+    if remove_locals:
+        store = pyro.get_param_store()
+        for key in ["z_i_loc", "z_i_scale", "c_indx_probs", "log_theta_i_loc", "log_theta_i_scale"]:
+            if key in store:
+                del store[key]
+    return ctmap
+
+
+def update_ctmap(ctmap: List[str], loaded_ctmap: List[str], ctype: torch.tensor) -> Tuple[List[str], torch.tensor]:
+    # Check if there is anything to do.
+    if len(ctmap) == len(loaded_ctmap) and all([a == b for a, b in zip(ctmap, loaded_ctmap)]):
+        # Same cell types, indexing is up to date.
+        return ctmap, ctype
+    all_types: List[str] = sorted(set(ctmap) | set(loaded_ctmap))
+    idxmap_new: List[int] = [all_types.index(x) for x in ctmap]
+    # Update `ctype`.
+    for i in range(len(ctmap)):
+        ctype[ctype == i] = idxmap_new[i]
+    # Update parameter "base_0" if present.
+    if "base_0" in pyro.get_param_store():
+        old_base_0 = pyro.param("base_0")
+        C = len(all_types)
+        G = old_base_0.shape[-1]
+        new_base_0 = torch.zeros(C, G).to(old_base_0.device)
+        idxmap_loaded: List[int] = [all_types.index(x) for x in loaded_ctmap]
+        for i in range(len(loaded_ctmap)):
+            new_base_0[idxmap_loaded[i]] = old_base_0[i]
+        pyro.get_param_store()["base_0"] = new_base_0
+    return all_types, ctype
 
 
 # Helper function.
@@ -59,7 +98,7 @@ def read_sparse_matrix(paths):
     return torch.vstack(list_of_sparse_tensors)
 
 
-def read_info_from_file(path):
+def read_meta_from_file(path):
     """
     Data for single-cell transcriptome, returns a 6-tuple with
        1. tensor of cell types as integers,
@@ -67,7 +106,8 @@ def read_info_from_file(path):
        3. tensor of groups as integers,
        4. tensor of states as integers,
        5. tensor of cell-type masks as boolean.
-       6. tensor of state masks as boolean.
+       6. tensor of state masks as boolean,
+       7. sorted list of unique cell types.
     """
 
     list_of_ctypes = list()
@@ -89,6 +129,7 @@ def read_info_from_file(path):
     if "ctype" not in indices:
         ctypes_tensor = torch.tensor(list_of_ctypes)
         ctype_mask_tensor = torch.zeros_like(ctypes_tensor).bool()
+        unique_ctypes = [None]
     else:
         unique_ctypes = sorted(list(set(list_of_ctypes)))
         if "?" in unique_ctypes:
@@ -131,4 +172,5 @@ def read_info_from_file(path):
         states_tensor,
         ctype_mask_tensor,
         state_mask_tensor,
+        unique_ctypes,
     )
