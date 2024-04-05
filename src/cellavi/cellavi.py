@@ -152,7 +152,6 @@ class plTrainHarness(pl.LightningModule):
         info = {"loss": loss, "lr": lr}
         self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
         self.cellavi.training_steps_performed = self.trainer.global_step
-        print(pyro.param("autonormal.locs.base_0"))
         return loss
 
     def compute_num_training_epochs(self):
@@ -201,12 +200,10 @@ class Cellavi(pyro.nn.PyroModule):
         # 1b) Define optional parts of the model.
         if B > 1:
             self.need_to_infer_batch_fx = True
-            self.output_batch_fx_scale = self.sample_batch_fx_scale
             self.output_batch_fx = self.sample_batch_fx
             self.collect_batch_fx_i = self.compute_batch_fx_i
         else:
             self.need_to_infer_batch_fx = False
-            self.output_batch_fx_scale = self.zero
             self.output_batch_fx = self.zero
             self.collect_batch_fx_i = self.zero
 
@@ -388,16 +385,6 @@ class Cellavi(pyro.nn.PyroModule):
         scale_factor = scale_factor.unsqueeze(-2)
         return scale_factor
 
-    def sample_batch_fx_scale(self):
-        batch_fx_scale = pyro.sample(
-            name="batch_fx_scale",
-            # dim(base): (P) x 1 x B
-            fn=dist.HalfNormal(
-                0.05 * torch.ones(1, 1).to(self.device),
-            ),
-        )
-        return batch_fx_scale
-
     def sample_global_base(self):
         global_base = pyro.sample(
             name="global_base",
@@ -435,11 +422,14 @@ class Cellavi(pyro.nn.PyroModule):
         base = global_base[None, ...].unsqueeze(-1).squeeze(-3)
         return base
 
-    def sample_batch_fx(self, scale):
+    def sample_batch_fx(self):
         batch_fx = pyro.sample(
             name="batch_fx",
             # dim(base): (P) x B x G
-            fn=dist.Normal(torch.zeros(1, 1).to(self.device), scale),
+            fn=dist.Normal(
+                0.00 * torch.zeros(1, 1).to(self.device),
+                0.05 * torch.ones(1, 1).to(self.device),
+            ),
         )
         return batch_fx
 
@@ -590,21 +580,6 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(scale_factor): (P x 1) x 1 x C
             scale_factor = self.output_scale_factor()
 
-        with pyro.plate("B", B, dim=-2):
-            # The parameter `batch_fx_scale` describes the standard
-            # deviations for every batch from the transcriptome of
-            # the cell type. The prior is half-normal, the quantiles
-            # 0.9, .99, .9999 equal to .064, .116 and .186. Beyond
-            # this, the probabilities drop fast, so that values
-            # above 0.25 are exceedingly unlikely. The standard
-            # deviation is applied to all the genes so it describes
-            # how far the batch is from the baseline transcriptome.
-            # A value of 0.25 means that every gene in the batch may
-            # vary by a factor ~2 compared to the baseline.
-
-            # dim(batch_fx_scale): (P) x B x 1
-            batch_fx_scale = self.output_batch_fx_scale()
-
         # Set up `scale_tril` from the correlation and the standard
         # deviation. This is the lower Cholesky factor of the co-
         # variance matrix (can be used directly in `Normal`).
@@ -658,7 +633,7 @@ class Cellavi(pyro.nn.PyroModule):
                 # 95% of the genes.
 
                 # dim(base): (P) x B x G
-                batch_fx = self.output_batch_fx(batch_fx_scale)
+                batch_fx = self.output_batch_fx()
 
             # Per-unit, per-type, per-gene sampling.
             with pyro.plate("KRxG", K * R, dim=-2):

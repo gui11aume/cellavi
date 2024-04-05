@@ -1,4 +1,5 @@
 import argparse
+import sys
 
 import cellavi
 import lightning.pytorch as pl
@@ -32,6 +33,7 @@ def validate(data):
 def main():
     parser = argparse.ArgumentParser(description="Cellavi")
     parser.add_argument("-K", type=int, default=1, help="Number of moduls (default: 1)")
+    parser.add_argument("-C", type=int, default=0, help="Number of cell types (default: auto)")
     parser.add_argument("--meta_path", type=str, required=True, help="Path to metadata file")
     parser.add_argument("--data_path", type=str, required=True, help="Path to data file")
     parser.add_argument("--out_path", type=str, required=True, help="Path to output file")
@@ -49,7 +51,6 @@ def main():
 
     device = args.device
 
-    cellavi.K = args.K
     meta_path = args.meta_path
     data_path = args.data_path
     out_path = args.out_path
@@ -64,6 +65,11 @@ def main():
     smask = meta[5].to(device)
     ctmap = meta[6]
 
+    # Make sure the total number of cell types is no smaller than
+    # the number of known (registered) cell types.
+    if (args.C > 0) and (args.C < len(ctmap)):
+        sys.exit("-C is less than the number of existing cell types")
+
     X = read_dense_matrix(data_path)
     X = X.to(device)
 
@@ -72,8 +78,9 @@ def main():
         ctmap, ctype = update_ctmap(ctmap, loaded_ctmap, ctype)
 
     # Set the dimensions.
+    cellavi.K = args.K
     cellavi.B = int(batch.max() + 1)  # Number of batches.
-    cellavi.C = len(ctmap)  # Number of cell types.
+    cellavi.C = args.C if args.C > 0 else len(ctmap)  # Number of cell types.
     cellavi.R = int(group.max() + 1)  # Number of groups.
     cellavi.G = int(X.shape[-1])  # Number of genes.
 
@@ -81,7 +88,7 @@ def main():
     data_idx = range(X.shape[0])
     validate(data)
 
-    model = Cellavi(data, marginalize=True)
+    model = Cellavi(data)
 
     if args.mode == "sample":
         sample = model.resample().cpu()
