@@ -6,7 +6,7 @@ import lightning.pytorch as pl
 import pyro
 import torch
 from cellavi import Cellavi, plTrainHarness
-from misc_cellavi import load_parameters, read_dense_matrix, read_meta_from_file, update_ctmap
+from misc_cellavi import load_parameters, read_dense_matrix, read_h5ad, read_meta_from_file, read_mtx, update_ctmap
 
 
 def validate(data):
@@ -32,21 +32,20 @@ def validate(data):
 
 def main():
     parser = argparse.ArgumentParser(description="Cellavi")
-    parser.add_argument("-K", type=int, default=1, help="Number of moduls (default: 1)")
-    parser.add_argument("-C", type=int, default=0, help="Number of cell types (default: auto)")
-    parser.add_argument("--meta_path", type=str, required=True, help="Path to metadata file")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to data file")
-    parser.add_argument("--out_path", type=str, required=True, help="Path to output file")
-    parser.add_argument("--device", type=str, default="cuda", help="'cpu', 'cuda', 'cuda:0', ... (default: 'cuda'")
-    parser.add_argument("--parameters", type=str, help="Path to file with parameters (optional)")
+    parser.add_argument("-K", type=int, default=1, help="number of moduls (default: 1)")
+    parser.add_argument("-C", type=int, default=0, help="number of cell types (default: auto)")
+    parser.add_argument("--data_path", type=str, required=True, help="path to data file")
+    parser.add_argument("--meta_path", type=str, help="path to metadata file")
+    parser.add_argument("--out_path", type=str, required=True, help="path to output file")
+    parser.add_argument("--device", type=str, default="cuda", help="'cpu', 'cuda', 'cuda:0', ... (default: 'cuda')")
+    parser.add_argument("--parameters", type=str, help="path to file with parameters (optional)")
     parser.add_argument(
-        "--mode", type=str, default="train", help="One of 'train', 'sample', 'freeze' (default: 'train')"
+        "--mode", type=str, default="train", help="one of 'train', 'sample', 'freeze' (default: 'train')"
     )
 
     args = parser.parse_args()
 
     pyro.clear_param_store()
-    pl.seed_everything(123)
     torch.set_float32_matmul_precision("high")
 
     device = args.device
@@ -55,23 +54,40 @@ def main():
     data_path = args.data_path
     out_path = args.out_path
 
-    meta = read_meta_from_file(meta_path)
+    #######################################################
+    if data_path.endswith(".h5ad"):
+        X, meta = read_h5ad(data_path)
+    elif data_path.endswith(".mtx"):
+        read_mtx(data_path)
+    else:
+        X = read_dense_matrix(data_path)
 
-    ctype = meta[0].to(device)
-    batch = meta[1].to(device)
-    group = meta[2].to(device)
-    modul = meta[3].to(device)
-    cmask = meta[4].to(device)
-    smask = meta[5].to(device)
-    ctmap = meta[6]
+    # X is a `scipy` CSR matrix now.
+    # X = X.to(device)
+
+    # Overwrite h5ad metadata if another file is specified.
+    if meta_path:
+        meta = read_meta_from_file(meta_path)
+
+    ctype = meta.ctypes_tensor.to(device)
+    batch = meta.batches_tensor.to(device)
+    group = meta.groups_tensor.to(device)
+    modul = meta.states_tensor.to(device)
+    cmask = meta.ctype_mask_tensor.to(device)
+    smask = meta.state_mask_tensor.to(device)
+    ctmap = meta.unique_ctypes
+
+    # Make sure that the total number of moduls is no smaller than
+    # the number of known (specified) moduls.
+    if args.K < len(torch.unique(modul)):
+        sys.exit("-K is less than the number of existing states")
 
     # Make sure the total number of cell types is no smaller than
-    # the number of known (registered) cell types.
+    # the number of known (specified) cell types.
     if (args.C > 0) and (args.C < len(ctmap)):
         sys.exit("-C is less than the number of existing cell types")
 
-    X = read_dense_matrix(data_path)
-    X = X.to(device)
+    #######################################################
 
     if args.parameters is not None:
         loaded_ctmap = load_parameters(args.parameters, device)
@@ -88,7 +104,7 @@ def main():
     data_idx = range(X.shape[0])
     validate(data)
 
-    model = Cellavi(data)
+    model = Cellavi(data, device=device)
 
     if args.mode == "sample":
         sample = model.resample().cpu()
@@ -119,6 +135,7 @@ def main():
         enable_checkpointing=False,
     )
 
+    pl.seed_everything(123)
     trainer.fit(harnessed, data_loader)
 
     # Save output to file.

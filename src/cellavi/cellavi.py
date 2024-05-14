@@ -1,4 +1,5 @@
 import math
+from typing import Any, Dict, List, Optional
 
 import lightning.pytorch as pl
 import pyro
@@ -6,6 +7,7 @@ import pyro.distributions as dist
 import torch
 import torch.nn.functional as F
 from pyro.infer.autoguide import AutoNormal
+from scipy.sparse import csr_matrix
 
 global K  # Number of moduls
 global B  # Number of batches
@@ -31,7 +33,7 @@ MIN_NUM_CELL_UPDATES = 24
 pyro.enable_validation(DEBUG)
 
 
-def subset(tensor: torch.tensor, idx: torch.tensor) -> torch.tensor:
+def subset(tensor: Optional[torch.Tensor], idx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if idx is None:
         return tensor
     if tensor is None:
@@ -39,14 +41,22 @@ def subset(tensor: torch.tensor, idx: torch.tensor) -> torch.tensor:
     return tensor.index_select(0, idx.to(tensor.device))
 
 
+def denslice(array: csr_matrix, idx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if idx is None:
+        return torch.tensor(array.dense())
+    if array is None:
+        return None
+    return torch.tensor(array[idx.cpu(), :].todense())
+
+
 class UnconditionMessenger(pyro.poutine.messenger.Messenger):
     """A modified version of `pyro.poutine.messenger.UnconditionMessenger`
     where it is possible to specify which sites to uncondition."""
 
-    def __init__(self, sites=[]):
+    def __init__(self, sites: List[str] = []):
         self.sites = sites
 
-    def _pyro_sample(self, msg):
+    def _pyro_sample(self, msg: Dict[str, Any]):
         if msg["name"] in self.sites and msg["is_observed"]:
             # The code below is taken from the
             # original `UnconditionMessenger`.
@@ -59,9 +69,9 @@ class UnconditionMessenger(pyro.poutine.messenger.Messenger):
 
 
 class plTrainHarness(pl.LightningModule):
-    def __init__(self, cellavi, lr=0.01):
+    def __init__(self, cellavi, lr: float = 0.01):
         super().__init__()
-        self.cellavi = cellavi
+        self.cellavi: Cellavi = cellavi
         self.pyro_model = cellavi.model
         self.pyro_guide = cellavi.guide
         self.lr = lr
@@ -97,7 +107,7 @@ class plTrainHarness(pl.LightningModule):
                 idx=torch.tensor([0]),
             )
 
-    def find_initial_conditions(self, seed=None, sweep=200):
+    def find_initial_conditions(self, seed=None, sweep=512):
         ncells = self.cellavi.ncells
         bsz = self.cellavi.bsz
         idx = torch.randperm(ncells)[:bsz].sort().values
@@ -169,21 +179,21 @@ class plTrainHarness(pl.LightningModule):
 
 
 class Cellavi(pyro.nn.PyroModule):
-    def __init__(self, data, marginalize=True, freeze=set()):
+    def __init__(self, data, marginalize=True, freeze=set(), device=None):
         super().__init__()
 
         # Unpack data.
-        self.ctype, self.batch, self.group, self.label, self.X, masks = data
-        self.cmask, self.smask = masks
+        (self.ctype, self.batch, self.group, self.label, self.X, masks) = data
+        (self.cmask, self.smask) = masks
 
         self.one_hot_ctype = F.one_hot(self.ctype, num_classes=C).float()
         # Format observed labels. Create one-hot encoding with label smoothing.
         # This is done by assigning value +2.3 or -2.3 so that the logits
         # stand for probabilities equal to 0.01 or 0.99.
-        self.one_hot_label = F.one_hot(self.label, num_classes=K).to(self.X.dtype)
+        self.one_hot_label = F.one_hot(self.label, num_classes=K)
         self.slabel = 4.6 * self.one_hot_label - 2.3 if K > 1 else self.one_hot_label
 
-        self.device = self.X.device
+        self.device = device if device is not None else self.X.device
         self.ncells = int(self.X.shape[0])
 
         self.bsz = self.ncells if self.ncells < SUBSMPL else SUBSMPL
@@ -226,11 +236,11 @@ class Cellavi(pyro.nn.PyroModule):
             self.collect_moduls_i = self.zero
 
         if self.cmask.all() or C == 1:
-            self.need_to_infer_cell_type = False
+            self.need_to_infer_cell_type: bool = False
             self.output_c_indx = self.return_ctype_as_is
             self.collect_base_i = self.compute_base_i_no_enum
         else:
-            self.need_to_infer_cell_type = True
+            self.need_to_infer_cell_type: bool = True
             self.output_c_indx = self.sample_c_indx
             self.collect_base_i = self.compute_base_i_enum
 
@@ -243,7 +253,7 @@ class Cellavi(pyro.nn.PyroModule):
         self.autonormal = AutoNormal(pyro.poutine.block(self.model, hide=local_variables))
         # Instantiate parameters now. Note that redefining `self.autonormal`
         # will destroy the current parameters of the autoguide.
-        self.autonormal._setup_prototype()
+        self.autonormal._setup_prototype(idx=torch.tensor([0]))  # Just one cell.
 
         # 3) Define the local parameters.
         if self.marginalize is False:
@@ -292,39 +302,34 @@ class Cellavi(pyro.nn.PyroModule):
 
     def initialize_autoguide_params(self):
         param_store = pyro.get_param_store()
-        # Site "moduls_KR".
         if "moduls_KR" not in self.frozen:
-            idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, K * R).to(self.device)
-            rows = subset(torch.log(self.X + 0.5), idx)
+            # Initialize randomly from the data. Take the average of
+            # two points in order to avoid picking outliers as centroids.
+            idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, 2 * K * R)
+            subX = denslice(self.X, idx).to(self.device)
+            rows = 0.5 * torch.log(subX[: K * R] + 0.5) + 0.5 * torch.log(subX[K * R :] + 0.5)
             param_store["autonormal.locs.moduls_KR"] = rows - rows.mean(dim=0, keepdim=True)
         if "base_0" not in self.frozen:
-            avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
-            if self.cmask.any():
-                if len(torch.unique(self.ctype[self.cmask])) == C:
-                    # At least one example is available for every label.
-                    zero = torch.zeros(C, G).to(self.device)
-                    index = self.ctype[self.cmask].unsqueeze(-1).expand(self.X[self.cmask].shape)
-                    base_0 = zero.scatter_reduce(
-                        0, index, torch.log(self.X[self.cmask] + 0.5), "mean", include_self=False
-                    )
-                else:
-                    # Some labels have no known examples.
-                    zero = torch.zeros(C, G).to(self.device)
-                    index = self.ctype.unsqueeze(-1).expand(self.X.shape)
-                    base_0 = zero.scatter_reduce(0, index, torch.log(self.X + 0.5), "mean", include_self=False)
-                    base_0 += 0.1 * torch.randn(base_0.shape, device=self.device)
-                    # Recompute label 0 plus all those that are missing.
-                    available = torch.unique(self.ctype[self.cmask])
-                    missing = set(torch.arange(C).tolist()).difference(available.tolist())
-                    idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, len(missing)).to(self.device)
-                    if 0 in available:
-                        base_0[0] = torch.mean(torch.log(self.X[self.ctype == 0 & self.cmask] + 0.5))
-            else:
-                idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, C).to(self.device)
-                base_0 = subset(torch.log(self.X + 0.5), idx)
-            param_store["autonormal.locs.base_0"] = (base_0 - avlog).transpose(-1, -2)
+            # Initialize randomly from the data. Take the average of
+            # two points in order to avoid picking outliers as centroids.
+            idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, 2 * C)
+            subX = denslice(self.X, idx).to(self.device)
+            base_0 = 0.5 * torch.log(subX[:C] + 0.5) + 0.5 * torch.log(subX[C:] + 0.5)
+            # Pick from known labels with probability 0.9.
+            available = torch.unique(self.ctype[self.cmask])
+            for c in available:
+                if torch.rand(1).item() < 0.9:
+                    pick_a_row = torch.log(self.X[(self.ctype == c) & self.cmask] + 0.5)
+                    idx = torch.randint(0, pick_a_row.shape[0], (1,)).to(self.device)
+                    base_0[c] = pick_a_row[idx]
+            # Normalize coefficients.
+            # avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
+            avg = base_0.mean(dim=0, keepdim=True)
+            param_store["autonormal.locs.base_0"] = (base_0 - avg).transpose(-1, -2)
         if "global_base" not in self.frozen:
-            avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
+            idx = None if self.ncells < 1024 else torch.multinomial(torch.ones(self.ncells) / self.ncells, 1024)
+            subX = denslice(self.X, idx).to(self.device)
+            avlog = torch.log(subX + 0.5).mean(dim=0, keepdim=True)
             param_store["autonormal.locs.global_base"] = avlog - avlog.mean()
 
     #  == Resample ==  #
@@ -652,7 +657,7 @@ class Cellavi(pyro.nn.PyroModule):
             ctype_i_mask = subset(self.cmask, indx_i)
             slabel_i = subset(self.slabel, indx_i)
             slabel_i_mask = subset(self.smask, indx_i)
-            x_i = subset(self.X, indx_i).to_dense()
+            x_i = denslice(self.X, indx_i).to(self.device)
 
             # Cell types as discrete indicators. The prior
             # distiribution is uniform over known cell types.
