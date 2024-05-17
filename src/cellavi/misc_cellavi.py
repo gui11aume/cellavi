@@ -1,10 +1,12 @@
 import re
 from typing import Any, Dict, List, Set, Tuple
 
+import numpy as np
 import pyro
 import scanpy
 import torch
 from scipy.io import mmread
+from scipy.sparse import csr_matrix
 
 LOCAL_PARAMS = ["z_i_loc", "z_i_scale", "c_indx_probs", "log_theta_i_loc", "log_theta_i_scale"]
 
@@ -193,14 +195,14 @@ def get_field_indices(items):
     return indices
 
 
-def read_dense_matrix(path, header_is_present=True):
+def read_text_matrix(path, header_is_present=True):
     with open(path) as f:
         if header_is_present:
             _ = next(f)
-        tensors = list()
+        arrays = list()
         for line in f:
-            tensors.append(torch.tensor([float(x) for x in line.split()]))
-    return torch.vstack(tensors)
+            arrays.append(np.array([float(x) for x in line.split()], dtype=np.float32))
+    return csr_matrix(np.vstack(arrays))
 
 
 def read_mtx(path):

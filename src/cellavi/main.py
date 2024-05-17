@@ -6,7 +6,7 @@ import lightning.pytorch as pl
 import pyro
 import torch
 from cellavi import Cellavi, plTrainHarness
-from misc_cellavi import load_parameters, read_dense_matrix, read_h5ad, read_meta_from_file, read_mtx, update_ctmap
+from misc_cellavi import load_parameters, read_h5ad, read_meta_from_file, read_mtx, read_text_matrix, update_ctmap
 
 
 def validate(data):
@@ -46,6 +46,7 @@ def main():
     args = parser.parse_args()
 
     pyro.clear_param_store()
+    torch.set_default_dtype(torch.float32)
     torch.set_float32_matmul_precision("high")
 
     device = args.device
@@ -60,7 +61,7 @@ def main():
     elif data_path.endswith(".mtx"):
         read_mtx(data_path)
     else:
-        X = read_dense_matrix(data_path)
+        X = read_text_matrix(data_path)
 
     # X is a `scipy` CSR matrix now.
     # X = X.to(device)
@@ -133,6 +134,7 @@ def main():
         enable_model_summary=True,
         logger=pl.loggers.CSVLogger("."),
         enable_checkpointing=False,
+        #        enable_checkpointing=True,
     )
 
     pl.seed_everything(123)

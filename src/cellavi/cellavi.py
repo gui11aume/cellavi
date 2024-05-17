@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from pyro.infer.autoguide import AutoNormal
 from scipy.sparse import csr_matrix
 
-global K  # Number of moduls
+global K  # Number of states
 global B  # Number of batches
 global C  # Number of types
 global R  # Number of groups
@@ -43,7 +43,7 @@ def subset(tensor: Optional[torch.Tensor], idx: Optional[torch.Tensor]) -> Optio
 
 def denslice(array: csr_matrix, idx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if idx is None:
-        return torch.tensor(array.dense())
+        return torch.tensor(array.todense())
     if array is None:
         return None
     return torch.tensor(array[idx.cpu(), :].todense())
@@ -92,7 +92,7 @@ class plTrainHarness(pl.LightningModule):
             )
 
         # Instantiate parameters of autoguides.
-        if self.cellavi.need_to_infer_cell_type or self.cellavi.need_to_infer_moduls:
+        if self.cellavi.need_to_infer_cell_type or self.cellavi.need_to_infer_states:
             self.find_initial_conditions()
 
         # Instantiate parameters of autoguides.
@@ -169,10 +169,10 @@ class plTrainHarness(pl.LightningModule):
         num_epochs = int(MIN_NUM_GLOBAL_UPDATES / updates_per_epoch)
         # We need a minimum of `MIN_NUM_GLOBAL_UPDATES` updates for
         # global parameters. If we marginalize and do not compute
-        # moduls (e.g., we infer cell types), there are no per-cell
+        # states (e.g., we infer cell types), there are no per-cell
         # parameters. Otherwise, there are per-cell parameters that
         # require at least `MIN_NUM_CELL_UPDATES` updates.
-        if self.cellavi.need_to_infer_moduls or self.cellavi.marginalize is False:
+        if self.cellavi.need_to_infer_states or self.cellavi.marginalize is False:
             return max(MIN_NUM_CELL_UPDATES, num_epochs)
         else:
             return num_epochs
@@ -225,15 +225,15 @@ class Cellavi(pyro.nn.PyroModule):
             self.output_base = self.reshape_global_base
 
         if K > 1:
-            self.need_to_infer_moduls = True
-            self.output_moduls = self.sample_moduls
+            self.need_to_infer_states = True
+            self.output_states = self.sample_states
             self.output_theta_i = self.sample_theta_i
-            self.collect_moduls_i = self.compute_moduls_i
+            self.collect_states_i = self.compute_states_i
         else:
-            self.need_to_infer_moduls = False
-            self.output_moduls = self.zero
+            self.need_to_infer_states = False
+            self.output_states = self.zero
             self.output_theta_i = self.zero
-            self.collect_moduls_i = self.zero
+            self.collect_states_i = self.zero
 
         if self.cmask.all() or C == 1:
             self.need_to_infer_cell_type: bool = False
@@ -277,7 +277,7 @@ class Cellavi(pyro.nn.PyroModule):
                 event_dim=1,
             )
 
-        if self.need_to_infer_moduls:
+        if self.need_to_infer_states:
             # Initialize `theta` randomly for cells where the state
             # is unknown, otherwise initialize with known state.
             self.log_theta_i_loc = pyro.nn.module.PyroParam(
@@ -302,13 +302,13 @@ class Cellavi(pyro.nn.PyroModule):
 
     def initialize_autoguide_params(self):
         param_store = pyro.get_param_store()
-        if "moduls_KR" not in self.frozen:
+        if "states_KR" not in self.frozen:
             # Initialize randomly from the data. Take the average of
             # two points in order to avoid picking outliers as centroids.
             idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, 2 * K * R)
             subX = denslice(self.X, idx).to(self.device)
             rows = 0.5 * torch.log(subX[: K * R] + 0.5) + 0.5 * torch.log(subX[K * R :] + 0.5)
-            param_store["autonormal.locs.moduls_KR"] = rows - rows.mean(dim=0, keepdim=True)
+            param_store["autonormal.locs.states_KR"] = rows - rows.mean(dim=0, keepdim=True)
         if "base_0" not in self.frozen:
             # Initialize randomly from the data. Take the average of
             # two points in order to avoid picking outliers as centroids.
@@ -319,9 +319,10 @@ class Cellavi(pyro.nn.PyroModule):
             available = torch.unique(self.ctype[self.cmask])
             for c in available:
                 if torch.rand(1).item() < 0.9:
-                    pick_a_row = torch.log(self.X[(self.ctype == c) & self.cmask] + 0.5)
-                    idx = torch.randint(0, pick_a_row.shape[0], (1,)).to(self.device)
-                    base_0[c] = pick_a_row[idx]
+                    subX = denslice(self.X, (self.ctype == c) & self.cmask).to(self.device)
+                    # pick_a_row = torch.log(self.X[(self.ctype == c) & self.cmask] + 0.5)
+                    idx = torch.randint(0, subX.shape[0], (1,)).to(self.device)
+                    base_0[c] = torch.log(subX[idx] + 0.5)
             # Normalize coefficients.
             # avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
             avg = base_0.mean(dim=0, keepdim=True)
@@ -438,15 +439,15 @@ class Cellavi(pyro.nn.PyroModule):
         )
         return batch_fx
 
-    def sample_moduls(self):
-        moduls_KR = pyro.sample(
-            name="moduls_KR",
-            # dim(moduls_KR): (P) x KR x G
+    def sample_states(self):
+        states_KR = pyro.sample(
+            name="states_KR",
+            # dim(states_KR): (P) x KR x G
             fn=dist.Normal(0.0 * torch.zeros(1, 1).to(self.device), 0.7 * torch.ones(1, 1).to(self.device)),
         )
-        # dim(moduls): (P) x K x R x G
-        moduls = moduls_KR.view(moduls_KR.shape[:-2] + (K, R, G))
-        return moduls
+        # dim(states): (P) x K x R x G
+        states = states_KR.view(states_KR.shape[:-2] + (K, R, G))
+        return states
 
     def sample_c_indx(self, ctype_i, ctype_i_mask):
         sampled_ctype_i = pyro.sample(
@@ -499,12 +500,12 @@ class Cellavi(pyro.nn.PyroModule):
         batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, ohb)
         return batch_fx_i
 
-    def compute_moduls_i(self, group, theta_i, moduls, indx_i):
+    def compute_states_i(self, group, theta_i, states, indx_i):
         # dim(ohg): ncells x R
-        ohg = subset(F.one_hot(group).to(moduls.dtype), indx_i)
-        # dim(moduls_i): (P) x ncells x G
-        moduls_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, moduls, ohg)
-        return moduls_i
+        ohg = subset(F.one_hot(group).to(states.dtype), indx_i)
+        # dim(states_i): (P) x ncells x G
+        states_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, states, ohg)
+        return states_i
 
     def compute_nu_and_k2(self, x_ij, mu, sg, idx):
         # dim(sg): (P) x 1 x G
@@ -559,6 +560,10 @@ class Cellavi(pyro.nn.PyroModule):
         t = 1.0 - math.exp(-2 * (3 * self.training_steps_performed / MIN_NUM_GLOBAL_UPDATES) ** 2)
         nu = (0.1 + 0.9 * t) * nu
         k2 = (0.1 + 0.9 * t) * k2 + (0.9 - 0.9 * t) * torch.ones_like(k2)
+
+        # Put a cap on `nu` and `k2` for numeric stability.
+        nu = torch.clamp(nu, min=-256, max=256)
+        k2 = torch.clamp(k2, min=-256, max=256)
 
         return nu, k2
 
@@ -647,8 +652,8 @@ class Cellavi(pyro.nn.PyroModule):
                 # lying in the interval (-1.15, 1.15), which
                 # corresponds to 3-fold effects.
 
-                # dim(moduls): (P) x K x R x G
-                moduls = self.output_moduls()
+                # dim(states): (P) x K x R x G
+                states = self.output_states()
 
         # Per-cell sampling.
         with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
@@ -665,7 +670,7 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(c_indx): C x (P) x 1 x ncells
             one_hot_c_indx = self.output_c_indx(one_hot_ctype_i, ctype_i_mask)
 
-            # Proportion of each modul in transcriptomes.
+            # Proportion of each state in transcriptomes.
             # The proportions are computed from the softmax
             # of K standard Gaussian variables. This means
             # that there is a 90% chance that two proportions
@@ -682,12 +687,12 @@ class Cellavi(pyro.nn.PyroModule):
             # dim(batch_fx_i): (P) x ncells x G
             batch_fx_i = self.collect_batch_fx_i(self.batch, batch_fx, indx_i)
 
-            # dim(moduls_i): (P) x ncells x G
-            moduls_i = self.collect_moduls_i(self.group, theta_i, moduls, indx_i)
+            # dim(states_i): (P) x ncells x G
+            states_i = self.collect_states_i(self.group, theta_i, states, indx_i)
 
             # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
-            mu_i = base_i + batch_fx_i + moduls_i
+            mu_i = base_i + batch_fx_i + states_i
 
             if self.marginalize:
                 # Marginalize "z_i". Optimize the variational
@@ -773,7 +778,7 @@ class Cellavi(pyro.nn.PyroModule):
             ctype_i_mask = subset(self.cmask, indx_i)
 
             # If more than one unit, sample them here.
-            if self.need_to_infer_moduls:
+            if self.need_to_infer_states:
                 # Posterior distribution of `log_theta_i`.
                 log_theta_i = pyro.sample(
                     name="log_theta_i_unobserved",
