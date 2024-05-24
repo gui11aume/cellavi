@@ -106,22 +106,7 @@ def read_meta_from_file(path):
 
 def read_h5ad(filename: str, metadata_file: str = None):
     adata = scanpy.read_h5ad(filename)
-    # .h5ad format is stored in CSR. It is faster to convert
-    # it to PyTorch tensor first, and then to COO format.
-    # The CSR format is only a beta version in PyTorch so
-    # we have to use the COO format.
-
-    # Let us try to use the `scipy` CSR format.
-    # csr = torch.sparse_csr_tensor(
-    #       crow_indices=adata.X.indptr,
-    #       col_indices=adata.X.indices,
-    #       values=adata.X.data,
-    #       size=adata.X.shape,
-    # )
-
-    # This object can be large, even if it
-    # is sparse, so we use 16 bits per entry.
-    # X = csr.to_sparse_coo().to(torch.float16)
+    X = adata.X.astype(np.float32)
 
     adata.obs["zero"] = 0  # Add default value at position -1.
     indices = get_field_indices(adata.obs.columns.tolist())
@@ -132,8 +117,7 @@ def read_h5ad(filename: str, metadata_file: str = None):
 
     metadata = CellaviMetadata(indices.keys(), list_of_ctypes, list_of_batches, list_of_groups, list_of_states)
 
-    # return X, metadata
-    return adata.X, metadata
+    return X, metadata
 
 
 def load_parameters(path: str, device: str, remove_locals: bool = True) -> List[str]:

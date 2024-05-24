@@ -14,25 +14,25 @@ def validate(data):
     ctype: torch.tensor
     batch: torch.tensor
     group: torch.tensor
-    modul: torch.tensor
+    state: torch.tensor
     X: torch.tensor
     cmask: torch.tensor
     smask: torch.tensor
 
-    (ctype, batch, group, modul, X, (cmask, smask)) = data
+    (ctype, batch, group, state, X, (cmask, smask)) = data
     ncells = X.shape[0]
 
     assert len(ctype) == ncells
     assert len(batch) == ncells
     assert len(group) == ncells
-    assert len(modul) == ncells
+    assert len(state) == ncells
     assert len(cmask) == ncells
     assert len(smask) == ncells
 
 
 def main():
     parser = argparse.ArgumentParser(description="Cellavi")
-    parser.add_argument("-K", type=int, default=1, help="number of moduls (default: 1)")
+    parser.add_argument("-K", type=int, default=1, help="number of states (default: 1)")
     parser.add_argument("-C", type=int, default=0, help="number of cell types (default: auto)")
     parser.add_argument("--data_path", type=str, required=True, help="path to data file")
     parser.add_argument("--meta_path", type=str, help="path to metadata file")
@@ -63,9 +63,6 @@ def main():
     else:
         X = read_text_matrix(data_path)
 
-    # X is a `scipy` CSR matrix now.
-    # X = X.to(device)
-
     # Overwrite h5ad metadata if another file is specified.
     if meta_path:
         meta = read_meta_from_file(meta_path)
@@ -73,14 +70,14 @@ def main():
     ctype = meta.ctypes_tensor.to(device)
     batch = meta.batches_tensor.to(device)
     group = meta.groups_tensor.to(device)
-    modul = meta.states_tensor.to(device)
+    state = meta.states_tensor.to(device)
     cmask = meta.ctype_mask_tensor.to(device)
     smask = meta.state_mask_tensor.to(device)
     ctmap = meta.unique_ctypes
 
-    # Make sure that the total number of moduls is no smaller than
-    # the number of known (specified) moduls.
-    if args.K < len(torch.unique(modul)):
+    # Make sure that the total number of states is no smaller than
+    # the number of known (specified) states.
+    if args.K < len(torch.unique(state)):
         sys.exit("-K is less than the number of existing states")
 
     # Make sure the total number of cell types is no smaller than
@@ -101,7 +98,7 @@ def main():
     cellavi.R = int(group.max() + 1)  # Number of groups.
     cellavi.G = int(X.shape[-1])  # Number of genes.
 
-    data = (ctype, batch, group, modul, X, (cmask, smask))
+    data = (ctype, batch, group, state, X, (cmask, smask))
     data_idx = range(X.shape[0])
     validate(data)
 
@@ -113,7 +110,7 @@ def main():
         return
     elif args.mode == "freeze":
         model.freeze("global_base")
-        model.freeze("moduls_KR")
+        model.freeze("states_KR")
 
     # Fitting.
     data_loader = torch.utils.data.DataLoader(

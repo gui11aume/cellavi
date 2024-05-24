@@ -91,9 +91,18 @@ class plTrainHarness(pl.LightningModule):
                 ignore_jit_warnings=True,
             )
 
-        # Instantiate parameters of autoguides.
+        # Instantiate parameters. Locals are deterministic.
+        self.cellavi.gather_average_profiles()
+        self.cellavi.initialize_locals()
+        ncells = self.cellavi.ncells
+        bsz = self.cellavi.bsz
+        idx = torch.randperm(ncells)[:bsz].sort().values
+        subX = denslice(self.cellavi.X, idx).to(self.cellavi.device)
         if self.cellavi.need_to_infer_cell_type or self.cellavi.need_to_infer_states:
-            self.find_initial_conditions()
+            # Globals are random, find a good seed if needed.
+            seed = self.find_initial_conditions(idx=idx)
+            pyro.set_rng_seed(seed)
+        self.cellavi.initialize_globals(subX=subX)
 
         # Instantiate parameters of autoguides.
         self.capture_params()
@@ -107,19 +116,17 @@ class plTrainHarness(pl.LightningModule):
                 idx=torch.tensor([0]),
             )
 
-    def find_initial_conditions(self, seed=None, sweep=512):
-        ncells = self.cellavi.ncells
-        bsz = self.cellavi.bsz
-        idx = torch.randperm(ncells)[:bsz].sort().values
+    def find_initial_conditions(self, idx, seed=None, sweep=512):
+        subX = denslice(self.cellavi.X, idx).to(self.cellavi.device)
         losses = list()
         if seed is None:
             for seed in range(sweep):
                 pyro.set_rng_seed(seed)
-                self.cellavi.initialize_autoguide_params()
+                self.cellavi.initialize_globals(subX)
                 loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
                 losses.append(float(loss))
             loss, seed = min([(x, i) for (i, x) in enumerate(losses)])
-        pyro.set_rng_seed(seed)
+        return seed
 
     def configure_optimizers(self):
         # Optimize parameters that are not frozen.
@@ -255,7 +262,71 @@ class Cellavi(pyro.nn.PyroModule):
         # will destroy the current parameters of the autoguide.
         self.autonormal._setup_prototype(idx=torch.tensor([0]))  # Just one cell.
 
-        # 3) Define the local parameters.
+    def freeze(self, param):
+        self.frozen.add(param)
+
+    def unfreeze(self, param):
+        self.frozen.remove(param)
+
+    def gather_average_profiles(self):
+        self.c_available = torch.unique(self.ctype[self.cmask])
+        self.s_available = torch.unique(self.label[self.smask])
+        self.avp = torch.ones(K, self.X.shape[-1]).to(self.device) / self.X.shape[-1]
+        if self.s_available.any():
+            labels = self.label[self.smask]
+            subX = denslice(self.X, self.smask).to(self.device)
+            for s in self.s_available:
+                p = subX[labels == s] / subX[labels == s].sum(dim=-1, keepdim=True)
+                self.avp[s] = p.mean(dim=0, keepdim=True)
+
+    def initialize_globals(self, subX):
+        param_store = pyro.get_param_store()
+        average = (subX + 0.5).mean(dim=0)
+        avlog = torch.log(average / average.sum(dim=-1, keepdim=True))
+        avlog -= avlog.mean()  # zero-center.
+
+        if "global_base" not in self.frozen:
+            param_store["autonormal.locs.global_base"] = avlog
+
+        if "base_0" not in self.frozen:
+            if C == 1:
+                # Only the global baseline is used in this case.
+                base_0 = torch.zeros_like(avlog)
+            else:
+                # Initialize randomly from the data. Take the average of
+                # two cells in order to avoid picking outliers as centroids.
+                idx = torch.multinomial(torch.ones(subX.shape[0]) / subX.shape[0], 2 * C)
+                two_cells = 0.5 * (subX[idx][:C] + subX[idx][C:]) + 0.5
+                base_0 = torch.log(two_cells / two_cells.sum(dim=-1, keepdim=True)) - avlog
+                for c in self.c_available:
+                    # Pick a cell of the right type with probability 0.9, otherwise keep random pair.
+                    if torch.rand(1).item() < 0.9:
+                        # TODO: this won't work for very large data sets.
+                        all_c = denslice(self.X, (self.ctype == c) & self.cmask).to(self.device)
+                        idx = torch.randint(0, all_c.shape[0], (1,)).to(self.device)
+                        one_cell = all_c[idx] + 0.5
+                        base_0[c] = torch.log(one_cell / one_cell.sum(dim=-1, keepdim=True)) - avlog
+                base_0 -= base_0.mean(dim=-1, keepdim=True)
+                param_store["autonormal.locs.base_0"] = base_0.transpose(-1, -2)
+
+        avbase_0 = base_0.mean(dim=0, keepdim=True)
+
+        if "states_KR" not in self.frozen:
+            # Initialize randomly from the data. Take the average of
+            # two cells in order to avoid picking outliers as centroids.
+            idx = torch.multinomial(torch.ones(subX.shape[0]) / subX.shape[0], 2 * K)
+            two_cells = 0.5 * (subX[idx][:K] + subX[idx][K:]) + 0.5
+            rows = torch.log(two_cells / two_cells.sum(dim=-1, keepdim=True)) - avlog - avbase_0
+            for s in self.s_available:
+                # Pick a cell of the right state with probability 0.9, otherwise keep random pair.
+                if torch.rand(1).item() < 0.9:
+                    all_s = denslice(self.X, (self.label == s) & self.smask).to(self.device)
+                    idx = torch.randint(0, all_s.shape[0], (1,)).to(self.device)
+                    one_cell = all_s[idx] + 0.5
+                    rows[s] = torch.log(one_cell / one_cell.sum(dim=-1, keepdim=True)) - avlog - avbase_0
+            param_store["autonormal.locs.states_KR"] = rows - rows.mean(dim=-1, keepdim=True)
+
+    def initialize_locals(self):
         if self.marginalize is False:
             self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(G, self.ncells).to(self.device), event_dim=0)
             self.z_i_scale = pyro.nn.module.PyroParam(
@@ -265,8 +336,12 @@ class Cellavi(pyro.nn.PyroModule):
             )
 
         if self.need_to_infer_cell_type:
+            import pdb
+
+            pdb.set_trace()  # TODO: just like for states.
             # Initialize `c_indx_probs` randomly for cells where the
             # type is unknown, otherwise initialize with known type.
+            # cdist = list()
             self.c_indx_probs = pyro.nn.module.PyroParam(
                 torch.where(
                     self.cmask.unsqueeze(-1).expand(self.ncells, C),
@@ -278,13 +353,20 @@ class Cellavi(pyro.nn.PyroModule):
             )
 
         if self.need_to_infer_states:
-            # Initialize `theta` randomly for cells where the state
-            # is unknown, otherwise initialize with known state.
+            # Initialize `theta` with state if known, otherwise
+            # find close profiles if available, otherwise random.
+            sdist = list()
+            for i in range(0, self.X.shape[0], SUBSMPL):
+                idx = torch.arange(self.X.shape[0])[i : i + SUBSMPL]
+                subX = denslice(self.X, idx).to(self.device)
+                subP = subX / subX.sum(dim=-1, keepdim=True)
+                sdist.append(1.0 / torch.square(subP.unsqueeze(1) - self.avp.unsqueeze(0)).sum(dim=-1))
+            sdist = torch.cat(sdist, dim=0)
             self.log_theta_i_loc = pyro.nn.module.PyroParam(
                 torch.where(
                     self.smask.unsqueeze(-1).expand(self.ncells, K),
                     4.6 * (self.one_hot_label - 0.5),
-                    0.1 * torch.randn(self.ncells, K).to(self.device),
+                    sdist / sdist.sum(dim=-1, keepdim=True),
                 ),
                 event_dim=1,
             )
@@ -293,45 +375,6 @@ class Cellavi(pyro.nn.PyroModule):
                 constraint=torch.distributions.constraints.positive,
                 event_dim=1,
             )
-
-    def freeze(self, param):
-        self.frozen.add(param)
-
-    def unfreeze(self, param):
-        self.frozen.remove(param)
-
-    def initialize_autoguide_params(self):
-        param_store = pyro.get_param_store()
-        if "states_KR" not in self.frozen:
-            # Initialize randomly from the data. Take the average of
-            # two points in order to avoid picking outliers as centroids.
-            idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, 2 * K * R)
-            subX = denslice(self.X, idx).to(self.device)
-            rows = 0.5 * torch.log(subX[: K * R] + 0.5) + 0.5 * torch.log(subX[K * R :] + 0.5)
-            param_store["autonormal.locs.states_KR"] = rows - rows.mean(dim=0, keepdim=True)
-        if "base_0" not in self.frozen:
-            # Initialize randomly from the data. Take the average of
-            # two points in order to avoid picking outliers as centroids.
-            idx = torch.multinomial(torch.ones(self.ncells) / self.ncells, 2 * C)
-            subX = denslice(self.X, idx).to(self.device)
-            base_0 = 0.5 * torch.log(subX[:C] + 0.5) + 0.5 * torch.log(subX[C:] + 0.5)
-            # Pick from known labels with probability 0.9.
-            available = torch.unique(self.ctype[self.cmask])
-            for c in available:
-                if torch.rand(1).item() < 0.9:
-                    subX = denslice(self.X, (self.ctype == c) & self.cmask).to(self.device)
-                    # pick_a_row = torch.log(self.X[(self.ctype == c) & self.cmask] + 0.5)
-                    idx = torch.randint(0, subX.shape[0], (1,)).to(self.device)
-                    base_0[c] = torch.log(subX[idx] + 0.5)
-            # Normalize coefficients.
-            # avlog = torch.log(self.X + 0.5).mean(dim=0, keepdim=True)
-            avg = base_0.mean(dim=0, keepdim=True)
-            param_store["autonormal.locs.base_0"] = (base_0 - avg).transpose(-1, -2)
-        if "global_base" not in self.frozen:
-            idx = None if self.ncells < 1024 else torch.multinomial(torch.ones(self.ncells) / self.ncells, 1024)
-            subX = denslice(self.X, idx).to(self.device)
-            avlog = torch.log(subX + 0.5).mean(dim=0, keepdim=True)
-            param_store["autonormal.locs.global_base"] = avlog - avlog.mean()
 
     #  == Resample ==  #
     def resample(self, num_samples=200, sample_z_from_posterior=False):
@@ -647,7 +690,7 @@ class Cellavi(pyro.nn.PyroModule):
 
             # Per-unit, per-type, per-gene sampling.
             with pyro.plate("KRxG", K * R, dim=-2):
-                # Unit effects have a Gaussian distribution
+                # Effects have a Gaussian distribution
                 # centered on 0. They have a 90% chance of
                 # lying in the interval (-1.15, 1.15), which
                 # corresponds to 3-fold effects.
