@@ -26,7 +26,7 @@ DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
 MIN_NUM_GLOBAL_UPDATES = 2048
-MIN_NUM_CELL_UPDATES = 24
+MIN_NUM_CELL_UPDATES = 48
 
 
 # Use only for debugging.
@@ -256,7 +256,7 @@ class Cellavi(pyro.nn.PyroModule):
 
         # 3) Instantiate autoguide.
         # Local variables must be hidden because they are defined in the guide.
-        local_variables = ["log_theta_i_unobserved", "ctype_i_unobserved", "z_i", "x_i"]
+        local_variables = ["log_theta_i", "ctype_i_unobserved", "z_i", "x_i"]
         self.autonormal = AutoNormal(pyro.poutine.block(self.model, hide=local_variables))
         # Instantiate parameters now. Note that redefining `self.autonormal`
         # will destroy the current parameters of the autoguide.
@@ -509,14 +509,20 @@ class Cellavi(pyro.nn.PyroModule):
         return ctype_i
 
     def sample_theta_i(self, slabel_i, slabel_i_mask):
+        prior_loc = torch.where(
+            slabel_i_mask.unsqueeze(-1).expand(slabel_i.shape),
+            slabel_i,
+            0.0 * torch.zeros_like(slabel_i),
+        ).unsqueeze(-3)
+        prior_scale = torch.where(
+            slabel_i_mask.unsqueeze(-1).expand(slabel_i.shape),
+            0.1 * torch.ones_like(slabel_i),
+            1.0 * torch.ones_like(slabel_i),
+        ).unsqueeze(-3)
         log_theta_i = pyro.sample(
             name="log_theta_i",
             # dim(log_theta_i): (P) x 1 x ncells | K
-            fn=dist.Normal(
-                loc=torch.zeros(1, 1, K).to(self.device), scale=torch.ones(1, 1, K).to(self.device)
-            ).to_event(1),
-            obs=slabel_i,
-            obs_mask=slabel_i_mask,
+            fn=dist.Normal(loc=prior_loc, scale=prior_scale).to_event(1),
         )
         # dim(theta_i): (P) x 1 x ncells x K
         theta_i = log_theta_i.softmax(dim=-1)
@@ -543,11 +549,18 @@ class Cellavi(pyro.nn.PyroModule):
         batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, ohb)
         return batch_fx_i
 
-    def compute_states_i(self, group, theta_i, states, indx_i):
+    def compute_states_i(self, group, theta_i, states, indx_i, PoE=True):
         # dim(ohg): ncells x R
         ohg = subset(F.one_hot(group).to(states.dtype), indx_i)
         # dim(states_i): (P) x ncells x G
-        states_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, states, ohg)
+        if PoE:
+            # This is the product-of-experts distribution.
+            states_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, states, ohg)
+        else:
+            # This is the mixture distribution.
+            states_ = torch.einsum("...KRG,nR->...nKG", states, ohg)
+            log_theta = theta_i.log().squeeze(-3).unsqueeze(-1)
+            states_i = torch.logsumexp(log_theta + states_, dim=-2)
         return states_i
 
     def compute_nu_and_k2(self, x_ij, mu, sg, idx):
@@ -731,7 +744,7 @@ class Cellavi(pyro.nn.PyroModule):
             batch_fx_i = self.collect_batch_fx_i(self.batch, batch_fx, indx_i)
 
             # dim(states_i): (P) x ncells x G
-            states_i = self.collect_states_i(self.group, theta_i, states, indx_i)
+            states_i = self.collect_states_i(self.group, theta_i, states, indx_i, PoE=False)
 
             # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
@@ -824,7 +837,7 @@ class Cellavi(pyro.nn.PyroModule):
             if self.need_to_infer_states:
                 # Posterior distribution of `log_theta_i`.
                 log_theta_i = pyro.sample(
-                    name="log_theta_i_unobserved",
+                    name="log_theta_i",
                     # dim(log_theta_i): (P) x 1 x ncells | K
                     fn=dist.Normal(
                         self.log_theta_i_loc,
