@@ -11,15 +11,37 @@ from scipy.sparse import csr_matrix
 LOCAL_PARAMS = ["z_i_loc", "z_i_scale", "c_indx_probs", "log_theta_i_loc", "log_theta_i_scale"]
 
 
+# Helper function.
+def get_field_indices(items):
+    indices = {}
+    # Search cell type.
+    matches = [re.search(r"^[Cc]ell_types?$", x) and True for x in items]
+    if any(matches):
+        indices["ctype"] = matches.index(True)
+    # Search batch.
+    matches = [re.search(r"^[Bb]atch(?:es)?$", x) and True for x in items]
+    if any(matches):
+        indices["batch"] = matches.index(True)
+    # Search group.
+    matches = [re.search(r"^[Gg]roups?$", x) and True for x in items]
+    if any(matches):
+        indices["group"] = matches.index(True)
+    # Search topics.
+    matches = [re.search(r"^[Ss]tates?$", x) and True for x in items]
+    if any(matches):
+        indices["topic"] = matches.index(True)
+    return indices
+
+
 class CellaviMetadata:
     """
     Metadata for single-cell transcriptome:
        1. tensor of cell types as integers,
        2. tensor of batches as integers,
        3. tensor of groups as integers,
-       4. tensor of states as integers,
+       4. tensor of topics as integers,
        5. tensor of cell-type masks as boolean.
-       6. tensor of state masks as boolean,
+       6. tensor of topic masks as boolean,
        7. sorted list of unique cell types.
     """
 
@@ -29,13 +51,13 @@ class CellaviMetadata:
         list_of_ctypes: List[float],
         list_of_batches: List[float],
         list_of_groups: List[float],
-        list_of_states: List[float],
+        list_of_topics: List[float],
     ):
         if "ctype" not in specified_fields:
             # Cell types are not provided. Set the cell type of every
-            # cell to 0 and mark it as masked.
+            # cell to 0 and mark it as unmasked.
             ctypes_tensor = torch.tensor(list_of_ctypes)
-            ctype_mask_tensor = torch.zeros_like(ctypes_tensor).bool()
+            ctype_mask_tensor = torch.ones_like(ctypes_tensor).bool()
             unique_ctypes = [None]
         else:
             # At last some cell types are provided.
@@ -50,20 +72,20 @@ class CellaviMetadata:
             ctypes_tensor = torch.tensor(list_of_ctype_ids)
             ctypes_tensor[~ctype_mask_tensor] = 0
 
-        if "state" not in specified_fields:
-            states_tensor = torch.tensor(list_of_states)
-            state_mask_tensor = torch.zeros_like(states_tensor).bool()
+        if "topic" not in specified_fields:
+            topics_tensor = torch.tensor(list_of_topics)
+            topic_mask_tensor = torch.zeros_like(topics_tensor).bool()
         else:
-            unique_states = sorted(list(set(list_of_states)))
-            if "?" in unique_states:
-                unique_states.remove("?")
-                state_mask = [state != "?" for state in list_of_states]
+            unique_topics = sorted(list(set(list_of_topics)))
+            if "?" in unique_topics:
+                unique_topics.remove("?")
+                topic_mask = [topic != "?" for topic in list_of_topics]
             else:
-                state_mask = [True] * len(list_of_states)
-            state_mask_tensor = torch.tensor(state_mask, dtype=torch.bool)
-            list_of_state_ids = [unique_states.index(x) if x in unique_states else 0 for x in list_of_states]
-            states_tensor = torch.tensor(list_of_state_ids)
-            states_tensor[~state_mask_tensor] = 0
+                topic_mask = [True] * len(list_of_topics)
+            topic_mask_tensor = torch.tensor(topic_mask, dtype=torch.bool)
+            list_of_topic_ids = [unique_topics.index(x) if x in unique_topics else 0 for x in list_of_topics]
+            topics_tensor = torch.tensor(list_of_topic_ids)
+            topics_tensor[~topic_mask_tensor] = 0
 
         unique_batches = sorted(list(set(list_of_batches)))
         list_of_batch_ids = [unique_batches.index(x) for x in list_of_batches]
@@ -76,9 +98,9 @@ class CellaviMetadata:
         self.ctypes_tensor = ctypes_tensor
         self.batches_tensor = batches_tensor
         self.groups_tensor = groups_tensor
-        self.states_tensor = states_tensor
+        self.topics_tensor = topics_tensor
         self.ctype_mask_tensor = ctype_mask_tensor
-        self.state_mask_tensor = state_mask_tensor
+        self.topic_mask_tensor = topic_mask_tensor
         self.unique_ctypes = unique_ctypes
 
 
@@ -86,7 +108,7 @@ def read_meta_from_file(path):
     list_of_ctypes: List[str] = list()
     list_of_batches: List[str] = list()
     list_of_groups: List[str] = list()
-    list_of_states: List[str] = list()
+    list_of_topics: List[str] = list()
 
     # Read in data from file.
     ncells = 0
@@ -99,9 +121,9 @@ def read_meta_from_file(path):
             list_of_ctypes.append(info[indices.get("ctype", -1)])
             list_of_batches.append(info[indices.get("batch", -1)])
             list_of_groups.append(info[indices.get("group", -1)])
-            list_of_states.append(info[indices.get("state", -1)])
+            list_of_topics.append(info[indices.get("topic", -1)])
 
-    return CellaviMetadata(indices.keys(), list_of_ctypes, list_of_batches, list_of_groups, list_of_states)
+    return CellaviMetadata(indices.keys(), list_of_ctypes, list_of_batches, list_of_groups, list_of_topics)
 
 
 def read_h5ad(filename: str, metadata_file: str = None):
@@ -113,9 +135,9 @@ def read_h5ad(filename: str, metadata_file: str = None):
     list_of_ctypes = adata.obs.iloc[:, indices.get("ctype", -1)].tolist()
     list_of_batches = adata.obs.iloc[:, indices.get("batch", -1)].tolist()
     list_of_groups = adata.obs.iloc[:, indices.get("group", -1)].tolist()
-    list_of_states = adata.obs.iloc[:, indices.get("state", -1)].tolist()
+    list_of_topics = adata.obs.iloc[:, indices.get("topic", -1)].tolist()
 
-    metadata = CellaviMetadata(indices.keys(), list_of_ctypes, list_of_batches, list_of_groups, list_of_states)
+    metadata = CellaviMetadata(indices.keys(), list_of_ctypes, list_of_batches, list_of_groups, list_of_topics)
 
     return X, metadata
 
@@ -125,7 +147,7 @@ def load_parameters(path: str, device: str, remove_locals: bool = True) -> List[
     ctmap: List[str] = loaded_store.pop("ctmap")
     for key in loaded_store["params"]:
         loaded_store["params"][key] = loaded_store["params"][key].to(device)
-    pyro.get_param_store().set_state(loaded_store)
+    pyro.get_param_store().set_topic(loaded_store)
     if remove_locals:
         store = pyro.get_param_store()
         for key in LOCAL_PARAMS:
@@ -155,28 +177,6 @@ def update_ctmap(ctmap: List[str], loaded_ctmap: List[str], ctype: torch.tensor)
             new_base_0[idxmap_loaded[i]] = old_base_0[i]
         pyro.get_param_store()["base_0"] = new_base_0
     return all_types, ctype
-
-
-# Helper function.
-def get_field_indices(items):
-    indices = {}
-    # Search cell type.
-    matches = [re.search(r"^[Cc]ell_types?$", x) and True for x in items]
-    if any(matches):
-        indices["ctype"] = matches.index(True)
-    # Search batch.
-    matches = [re.search(r"^[Bb]atch(?:es)?$", x) and True for x in items]
-    if any(matches):
-        indices["batch"] = matches.index(True)
-    # Search group.
-    matches = [re.search(r"^[Gg]roups?$", x) and True for x in items]
-    if any(matches):
-        indices["group"] = matches.index(True)
-    # Search states.
-    matches = [re.search(r"^[Ss]tates?$", x) and True for x in items]
-    if any(matches):
-        indices["state"] = matches.index(True)
-    return indices
 
 
 def read_text_matrix(path, header_is_present=True):

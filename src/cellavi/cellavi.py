@@ -27,7 +27,7 @@ G: int = -1
 DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
-MIN_NUM_GLOBAL_UPDATES = 4096
+MIN_NUM_GLOBAL_UPDATES = 2048
 MIN_NUM_EPOCHS = 24
 
 GLOBAL_SEED = 0
@@ -137,20 +137,18 @@ class plTrainHarness(pl.LightningModule):
 
     def setup(self, stage=None):
         if stage == "fit":
-            # Fix initial values of the local parameters.
-            self.cellavi.initialize_locals_if_required()
             # Create the initialization dataset.
             ncells = self.cellavi.ncells
             bsz = self.cellavi.bsz
             idx = torch.randperm(ncells)[:bsz].sort().values
             X = denslice(self.cellavi.X, idx).to(self.cellavi.device)
-            self.validation_losses = list()
+            self.cellavi.initialize_locals()
 
             sys.stderr.write("Optimizing initial conditions...\n")
             losses = list()
             for seed in range(512):
                 pyro.set_rng_seed(seed)
-                self.cellavi.initialize_globals_and_amortizer(X)
+                self.cellavi.initialize_parameters(X)
                 with torch.inference_mode():
                     loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
                 losses.append(float(loss))
@@ -158,7 +156,7 @@ class plTrainHarness(pl.LightningModule):
             # Initialize the model with the best seed.
             _, seed = min([(x, i) for (i, x) in enumerate(losses)])
             pyro.set_rng_seed(seed)
-            self.cellavi.initialize_globals_and_amortizer(X)
+            self.cellavi.initialize_parameters(X)
 
             # Instantiate parameters of autoguides.
             self.capture_params()
@@ -236,6 +234,9 @@ class Cellavi(pyro.nn.PyroModule):
         (self.ctype, self.batch, self.group, self.label, self.X, masks) = data
         (self.cmask, self.smask) = masks
 
+        # FIXME: disallow unknown cell types.
+        assert self.cmask.all()
+
         self.one_hot_ctype = F.one_hot(self.ctype, num_classes=C).float()
         # Format observed labels. Create one-hot encoding with label smoothing.
         # Assign values so that the probability of the provided label is 0.95.
@@ -308,7 +309,7 @@ class Cellavi(pyro.nn.PyroModule):
             ).to(self.device)
 
         # 5) Create a bank of labelled cells.
-        self.gather_available_labels()
+        self.gather_average_profiles()
 
     def freeze(self, param):
         self.frozen.add(param)
@@ -316,74 +317,31 @@ class Cellavi(pyro.nn.PyroModule):
     def unfreeze(self, param):
         self.frozen.remove(param)
 
-    def gather_available_labels(self):
+    def gather_average_profiles(self):
         # Cell types.
-        self.labelled_ctype = dict()
-        self.available_ctype_labels = torch.unique(self.ctype[self.cmask])
-        if self.available_ctype_labels.any():
-            for ctype in self.available_ctype_labels:
-                (idx,) = torch.where((self.ctype == ctype) & self.cmask)
-                self.labelled_ctype[int(ctype)] = denslice(self.X, idx).to(self.device)
+        self.ctype_profile = dict()
+        for c in range(C):
+            (idx,) = torch.where(self.ctype == c)
+            chunks = [0.5 * torch.ones(1, G).to(self.device) / G]  # Add 1/2 pseudo-count.
+            for i in range(0, len(idx), SUBSMPL):
+                x_i = denslice(self.X, idx[i : i + SUBSMPL]).to(self.device)
+                chunks.append(torch.sum(x_i / x_i.sum(dim=-1, keepdim=True), dim=0))
+            self.ctype_profile[c] = torch.sum(torch.vstack(chunks), dim=0) / (1 + len(idx))
+        # Grand average profile over cell types.
+        self.av = torch.stack([self.ctype_profile[c] for c in range(C)]).mean(dim=0)
         # Topics.
-        self.labelled_topic = dict()
+        self.topic_profile = dict()
         self.available_topic_labels = torch.unique(self.label[self.smask])
         if self.available_topic_labels.any():
-            for topic in self.available_topic_labels:
-                (idx,) = torch.where((self.label == topic) & self.smask)
-                self.labelled_topic[int(topic)] = denslice(self.X, idx).to(self.device)
+            for t in self.available_topic_labels:
+                (idx,) = torch.where((self.label == t) & self.smask)
+                chunks = [0.5 * torch.ones(1, G).to(self.device) / G]  # Add 1/2 pseudo-count.
+                for i in range(0, len(idx), SUBSMPL):
+                    x_i = denslice(self.X, idx[i : i + SUBSMPL]).to(self.device)
+                    chunks.append(torch.sum(x_i / x_i.sum(dim=-1, keepdim=True), dim=0))
+                self.topic_profile[int(t)] = torch.sum(torch.vstack(chunks), dim=0) / (1 + len(idx))
 
-    def initialize_globals_and_amortizer(self, subX):
-        # 1) Initalize the inference network.
-        if self.amortize is True:
-            for name, module in self.amortizer.named_modules():
-                if isinstance(module, pyro.nn.PyroModule[torch.nn.Linear]):
-                    torch.nn.init.xavier_uniform_(module.weight.data)
-
-        # 2) Initialize the global parameters.
-        param_store = pyro.get_param_store()
-        average = (subX + 0.5).mean(dim=0)
-        avlog = torch.log(average) - torch.log(average).mean()  # zero-center.
-
-        if "global_base" not in self.frozen:
-            # param_store["autonormal.locs.global_base"] = avlog
-            param_store["autonormal.locs.global_base"] = avlog
-
-        if "base_0" not in self.frozen:
-            if C == 1:
-                # Only the global baseline is used in this case.
-                base_0 = avlog
-            else:
-                # Initialize randomly from the data. Take the average of
-                # two cells in order to avoid picking outliers as centroids.
-                idx = torch.multinomial(torch.ones(subX.shape[0]) / subX.shape[0], 2 * C)
-                two_cells = 0.5 * (subX[idx][:C] + subX[idx][C:]) + 0.5
-                base_0 = torch.log(two_cells) - avlog
-                for ctype in self.available_ctype_labels:
-                    # Pick type average with probability 0.9, otherwise keep random pair.
-                    if torch.rand(1).item() < 0.9:
-                        average = (self.labelled_ctype[int(ctype)] + 0.5).mean(dim=0)
-                        base_0[int(ctype)] = torch.log(average) - avlog
-                base_0 -= base_0.mean(dim=-1, keepdim=True)
-                param_store["autonormal.locs.base_0"] = base_0.transpose(-1, -2)
-
-        avbase_0 = base_0.mean(dim=0, keepdim=True)
-
-        if "topics_KR" not in self.frozen:
-            # Initialize randomly from the data. Take the average of
-            # two cells in order to avoid picking outliers as centroids.
-            idx = torch.multinomial(torch.ones(subX.shape[0]) / subX.shape[0], 2 * K)
-            two_cells = 0.5 * (subX[idx][:K] + subX[idx][K:]) + 0.5
-            rows = torch.log(two_cells) - avbase_0
-            for topic in self.available_topic_labels:
-                # Pick a cell with the right topic with probability 0.9, otherwise keep random pair.
-                if torch.rand(1).item() < 0.9:
-                    average = (self.labelled_topic[int(topic)] + 0.5).mean(dim=0)
-                    rows[int(topic)] = torch.log(average) - avbase_0
-            rows -= rows.mean(dim=-1, keepdim=True)
-            param_store["autonormal.locs.topics_KR"] = rows
-
-    def initialize_locals_if_required(self):
-        """Initialize local variables with deterministic values."""
+    def initialize_locals(self):
         if self.collapse is False:
             self.z_i_loc = pyro.nn.module.PyroParam(torch.zeros(G, self.ncells).to(self.device), event_dim=0)
             self.z_i_scale = pyro.nn.module.PyroParam(
@@ -391,51 +349,61 @@ class Cellavi(pyro.nn.PyroModule):
                 constraint=torch.distributions.constraints.positive,
                 event_dim=0,
             )
+
         if self.amortize is False:
-            # Initialize `theta` with state if known, otherwise
-            # find close profiles if available, otherwise random.
-            coeff = list()
-            normal = dict()
-            for i in self.available_topic_labels:
-                x_i = self.labelled_topic[int(i)]
-                freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-            dummy = torch.ones(1, G).to(self.device)
-            lab_x = torch.vstack([self.labelled_topic.get(i, dummy) for i in range(K)])
-            lab_x /= lab_x.sum(dim=-1, keepdim=True)
-            lab_n = [len(self.labelled_topic.get(i, dummy)) for i in range(K)]
-            lab_j = torch.repeat_interleave(torch.arange(K), torch.tensor(lab_n))
-            keep = lab_x.std(dim=0).sort(descending=True).indices[:2048]
-            pca_x = (lab_x[:, keep] - lab_x[:, keep].mean(dim=0)) / lab_x[:, keep].std(dim=0)
-            cov = pca_x.T @ pca_x / pca_x.shape[0]
-            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-            proj_x = pca_x @ eigenvectors[:, -K:]
-            normal = dict()
-            for i in range(K):
-                proj_i = proj_x[lab_j == i, :]
-                mean_i = proj_i.mean(dim=0, keepdim=True)
-                cov_i = torch.inner((proj_i - mean_i).T, (proj_i - mean_i).T) / proj_i.shape[0]
-                # Tikhonov regularization.
-                cov_i += 1e-6 + torch.eye(K).to(self.device)
-                # normal[int(i)] = torch.distributions.MultivariateNormal(mean_i.squeeze(-1), cov_i)
-                normal[int(i)] = pyro.distributions.MultivariateStudentT(
-                    df=1, loc=mean_i.squeeze(-1), scale_tril=torch.linalg.cholesky(cov_i)
-                )
-            for i in range(0, self.ncells, SUBSMPL):
-                idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-                x_i = denslice(self.X, idx).to(self.device)
-                freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-                pca_y = (freq_i[:, keep] - lab_x[:, keep].mean(dim=0)) / lab_x[:, keep].std(dim=0)
-                proj_y = pca_y @ eigenvectors[:, -K:]
-                xx = [normal[i].log_prob(proj_y) for i in range(K)]
-                xxx = torch.stack(xx).transpose(-1, -2)
-                xxxx = torch.clamp(xxx - xxx.mean(dim=-1, keepdim=True), min=-3, max=3)
-                coeff.append(xxxx)
-            init_value = torch.cat(coeff, dim=0)
+            if not self.available_topic_labels.any():
+                # Easy case: no labelled cells. Initialize randomly.
+                init_value = 0.1 * torch.randn(self.ncells, K).to(self.device)
+            else:
+                # Hard case: some cells are labelled so initialization matters.
+                # 1) Get all labelled cells.
+                lbl_obs = denslice(self.X, self.smask).to(self.device)
+                freq = lbl_obs / lbl_obs.sum(dim=-1, keepdim=True)
+                # 2) Pick top 2048 most variable genes.
+                keep = freq.std(dim=0).sort(descending=True).indices[:2048]
+                # 3) Perform PCA on the labelled cells.
+                x = (freq[:, keep] - freq[:, keep].mean(dim=0)) / freq[:, keep].std(dim=0)
+                cov = (x.T @ x) / x.shape[0]
+                _, eigenvectors = torch.linalg.eigh(cov)
+                proj_x = x @ eigenvectors[:, -K:]
+                # 4) Fit a Student's t-distribution to each topic.
+                student = dict()
+                for t in self.available_topic_labels:
+                    proj_t = proj_x[self.label[self.smask] == t, :]
+                    mean_t = proj_t.mean(dim=0, keepdim=True)
+                    cov_t = torch.inner((proj_t - mean_t).T, (proj_t - mean_t).T) / proj_t.shape[0]
+                    # Tikhonov regularization.
+                    cov_t += 1e-6 * torch.eye(K).to(self.device)
+                    student[int(t)] = pyro.distributions.MultivariateStudentT(
+                        df=1.0,  # Equivalent to Cauchy distribution.
+                        loc=mean_t.squeeze(-1),
+                        scale_tril=torch.linalg.cholesky(cov_t),
+                    )
+                # 5) Assign potential clusters to every cell.
+                init_value = list()
+                for i in range(0, self.ncells, SUBSMPL):
+                    idx = torch.arange(self.ncells)[i : i + SUBSMPL]
+                    x_i = denslice(self.X, idx).to(self.device)
+                    freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
+                    y = (freq_i[:, keep] - freq[:, keep].mean(dim=0)) / freq[:, keep].std(dim=0)
+                    proj_y = y @ eigenvectors[:, -K:]
+                    log_probs = torch.stack(
+                        [
+                            student[i].log_prob(proj_y)
+                            if i in self.available_topic_labels
+                            else torch.zeros_like(proj_y)
+                            for i in range(K)
+                        ]
+                    ).transpose(-1, -2)
+                    log_theta_i_loc = torch.clamp(log_probs - log_probs.mean(dim=-1, keepdim=True), min=-3, max=3)
+                    init_value.append(log_theta_i_loc)
+                init_value = torch.cat(init_value, dim=0)
+
             self.log_theta_i_loc = pyro.nn.module.PyroParam(
                 torch.where(
                     self.smask.unsqueeze(-1).expand(self.ncells, K),
                     self.slabel,  # Smooth labels where available.
-                    init_value,  # Otherwise, use close profiles.
+                    init_value,  # Otherwise, use matching profiles.
                 ),
                 event_dim=1,
             )
@@ -446,12 +414,12 @@ class Cellavi(pyro.nn.PyroModule):
             )
 
         if self.need_to_infer_cell_type:
-            import pdb
-
-            pdb.set_trace()  # TODO: just like for topics.
             # Initialize `c_indx_probs` randomly for cells where the
             # type is unknown, otherwise initialize with known type.
             # cdist = list()
+            import pdb
+
+            pdb.set_trace()
             self.c_indx_probs = pyro.nn.module.PyroParam(
                 torch.where(
                     self.cmask.unsqueeze(-1).expand(self.ncells, C),
@@ -461,6 +429,48 @@ class Cellavi(pyro.nn.PyroModule):
                 constraint=torch.distributions.constraints.simplex,
                 event_dim=1,
             )
+
+    def initialize_parameters(self, subX):
+        # 1) Initalize the amortizer.
+        if self.amortize is True:
+            for name, module in self.amortizer.named_modules():
+                if isinstance(module, pyro.nn.PyroModule[torch.nn.Linear]):
+                    torch.nn.init.xavier_uniform_(module.weight.data)
+
+        # 2) Initialize global parameters.
+        param_store = pyro.get_param_store()
+        avlog = torch.log(self.av) - torch.log(self.av).mean()  # zero-center.
+
+        if "global_base" not in self.frozen:
+            param_store["autonormal.locs.global_base"] = avlog
+
+        if "base_0" not in self.frozen and C > 1:
+            # Initialize randomly from the data. Take the average of
+            # two cells in order to avoid picking outliers as centroids.
+            idx = torch.multinomial(torch.ones(subX.shape[0]) / subX.shape[0], 2 * C)
+            two_cells = 0.5 * (subX[idx][:C] + subX[idx][C:]) + 0.5
+            base_0 = torch.log(two_cells) - avlog
+            for ctype in range(C):
+                # Pick type average with probability 0.9, otherwise keep random pair.
+                if torch.rand(1).item() < 0.9:
+                    average = self.ctype_profile[int(ctype)]
+                    base_0[int(ctype)] = torch.log(average) - avlog
+            base_0 -= base_0.mean(dim=-1, keepdim=True)
+            param_store["autonormal.locs.base_0"] = base_0.transpose(-1, -2)
+
+        if "topics_KR" not in self.frozen:
+            # Initialize randomly from the data. Take the average of
+            # two cells in order to avoid picking outliers as centroids.
+            idx = torch.multinomial(torch.ones(subX.shape[0]) / subX.shape[0], 2 * K)
+            two_cells = 0.5 * (subX[idx][:K] + subX[idx][K:]) + 0.5
+            rows = torch.log(two_cells / two_cells.sum(dim=-1, keepdim=True)) - avlog
+            for t in self.available_topic_labels:
+                # Pick a cell with the right topic with probability 0.9, otherwise keep random pair.
+                if torch.rand(1).item() < 0.9:
+                    profile = self.topic_profile[int(t)]
+                    rows[int(t)] = torch.log(profile) - avlog
+            rows -= rows.mean(dim=0, keepdim=True)
+            param_store["autonormal.locs.topics_KR"] = rows
 
     #  == Resample ==  #
     def resample(self, num_samples=200, sample_z_from_posterior=False):
@@ -690,30 +700,30 @@ class Cellavi(pyro.nn.PyroModule):
         xlog = x_ij.sum(dim=-1, keepdim=True).log()
         nu = -0.5 * torch.ones_like(mu_)
 
-        min_nu = -16 * torch.ones_like(x_ij)
-        max_nu = torch.clamp(x_ij * s2_ - 0.001, max=16)
+        min_nu = -32 * torch.ones_like(x_ij)
+        max_nu = torch.clamp(x_ij * s2_ - 0.001, max=32)
 
         T_ = xlog - torch.logsumexp(mu_, dim=-1, keepdim=True)
         for _ in range(4):
-            k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=16)
+            k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=32)
             f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
             df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
             nu = torch.clamp(nu - f / df, min=min_nu, max=max_nu)
 
         for _ in range(5):
             nu__ = torch.clamp(nu - 1.0 / df, min=min_nu, max=max_nu)
-            k2__ = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu__), max=16)
+            k2__ = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu__), max=32)
             l1 = torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
             l2 = torch.logsumexp(mu_ + nu__ + 0.5 * k2__, dim=-1, keepdim=True)
             delta = torch.clamp(-(T_ - xlog + l1) / (1 + l2 - l1), min=-1, max=1)
             nu = torch.clamp(nu - delta / df, min=min_nu, max=max_nu)
-            k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=16)
+            k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=32)
             T_ = xlog - torch.logsumexp(mu_ + nu + 0.5 * k2, dim=-1, keepdim=True)
             f = T_ + mu_ + nu + 0.5 * k2 - torch.log(x_ij - nu / s2_)
             df = 1 + 0.5 * s2_ / torch.square(s2_ * x_ij + 1 - nu) + 1.0 / (s2_ * x_ij - nu)
             nu = torch.clamp(nu - f / df, min=min_nu, max=max_nu)
 
-        k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=16)
+        k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=32)
 
         # Scale estimates over training steps.
         t = 1.0 - math.exp(-2 * (3 * self.training_steps_performed / MIN_NUM_GLOBAL_UPDATES) ** 2)
@@ -722,7 +732,7 @@ class Cellavi(pyro.nn.PyroModule):
 
         # Put a cap on `nu` and `k2` for numeric stability.
         nu = torch.clamp(nu, min=min_nu, max=max_nu)
-        k2 = torch.clamp(k2, min=0.01, max=16)
+        k2 = torch.clamp(k2, min=1e-6, max=32)
 
         return nu, k2
 
