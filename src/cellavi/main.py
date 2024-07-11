@@ -112,11 +112,22 @@ def main():
         model.freeze("global_base")
         model.freeze("topics_KR")
 
-    # Fitting.
-    data_loader = torch.utils.data.DataLoader(
+    # The train data loader is a dummy list of indices.
+    train_data_loader = torch.utils.data.DataLoader(
         dataset=data_idx,
         shuffle=True,
         batch_size=cellavi.SUBSMPL,
+    )
+
+    # The test data loader is the same same dummy list of indices
+    # but shuffling is turned off so that cells are processed in
+    # the same order as in the input data. We also make the batch
+    # size 64 times larger because we just call the amortizer
+    # (no gradient updates are performed).
+    test_data_loader = torch.utils.data.DataLoader(
+        dataset=data_idx,
+        shuffle=False,
+        batch_size=64 * cellavi.SUBSMPL,
     )
 
     harnessed = plTrainHarness(model)
@@ -131,11 +142,12 @@ def main():
         enable_model_summary=True,
         logger=pl.loggers.CSVLogger("."),
         enable_checkpointing=False,
-        #        enable_checkpointing=True,
+        # enable_checkpointing=True,
     )
 
     pl.seed_everything(123)
-    trainer.fit(harnessed, data_loader)
+    trainer.fit(harnessed, train_data_loader)
+    trainer.test(harnessed, test_data_loader)
 
     # Save output to file.
     param_store = pyro.get_param_store().get_state()
