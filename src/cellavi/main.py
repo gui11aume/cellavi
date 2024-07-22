@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--data_path", type=str, required=True, help="path to data file")
     parser.add_argument("--meta_path", type=str, help="path to metadata file")
     parser.add_argument("--out_path", type=str, required=True, help="path to output file")
-    parser.add_argument("--device", type=str, default="cuda", help="'cpu', 'cuda', 'cuda:0', ... (default: 'cuda')")
+    parser.add_argument("--device", type=str, default="cuda:0", help="'cpu', 'cuda', 'cuda:0', ... (default: 'cuda:0')")
     parser.add_argument("--parameters", type=str, help="path to file with parameters (optional)")
     parser.add_argument(
         "--mode", type=str, default="train", help="one of 'train', 'sample', 'freeze' (default: 'train')"
@@ -99,7 +99,7 @@ def main():
     cellavi.G = int(X.shape[-1])  # Number of genes.
 
     data = (ctype, batch, group, topic, X, (cmask, smask))
-    data_idx = range(X.shape[0])
+    data_idx = torch.arange(X.shape[0]).to(device)
     validate(data)
 
     model = Cellavi(data, device=device)
