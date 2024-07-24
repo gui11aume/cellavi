@@ -6,28 +6,10 @@ import lightning.pytorch as pl
 import pyro
 import torch
 from cellavi import Cellavi, plTrainHarness
+from cellavi_data import CellaviCollator, CellaviData
 from misc_cellavi import load_parameters, read_h5ad, read_meta_from_file, read_mtx, read_text_matrix, update_ctmap
 
-
-def validate(data):
-    # Validate data (make sure that all tensors have the same length).
-    ctype: torch.tensor
-    batch: torch.tensor
-    group: torch.tensor
-    topic: torch.tensor
-    X: torch.tensor
-    cmask: torch.tensor
-    smask: torch.tensor
-
-    (ctype, batch, group, topic, X, (cmask, smask)) = data
-    ncells = X.shape[0]
-
-    assert len(ctype) == ncells
-    assert len(batch) == ncells
-    assert len(group) == ncells
-    assert len(topic) == ncells
-    assert len(cmask) == ncells
-    assert len(smask) == ncells
+SUBSMPL = 512
 
 
 def main():
@@ -93,16 +75,29 @@ def main():
 
     # Set the dimensions.
     cellavi.K = args.K
-    cellavi.B = int(batch.max() + 1)  # Number of batches.
     cellavi.C = args.C if args.C > 0 else len(ctmap)  # Number of cell types.
+    cellavi.B = int(batch.max() + 1)  # Number of batches.
     cellavi.R = int(group.max() + 1)  # Number of groups.
     cellavi.G = int(X.shape[-1])  # Number of genes.
 
-    data = (ctype, batch, group, topic, X, (cmask, smask))
     data_idx = torch.arange(X.shape[0]).to(device)
-    validate(data)
 
-    model = Cellavi(data, device=device)
+    ddata = CellaviData(
+        x=X,
+        ctype=ctype,
+        batch=batch,
+        group=group,
+        topic=topic,
+        cmask=cmask,
+        smask=smask,
+        chunk_size=SUBSMPL,
+        K=cellavi.K,
+        C=cellavi.C,
+        B=cellavi.B,
+        R=cellavi.R,
+    )
+
+    model = Cellavi(X=X, ddata=ddata, device=device)
 
     if args.mode == "sample":
         sample = model.resample().cpu()
@@ -117,6 +112,7 @@ def main():
         dataset=data_idx,
         shuffle=True,
         batch_size=cellavi.SUBSMPL,
+        collate_fn=CellaviCollator(ddata),
     )
 
     # The test data loader is the same same dummy list of indices
@@ -128,6 +124,7 @@ def main():
         dataset=data_idx,
         shuffle=False,
         batch_size=64 * cellavi.SUBSMPL,
+        collate_fn=CellaviCollator(ddata),
     )
 
     harnessed = plTrainHarness(model)

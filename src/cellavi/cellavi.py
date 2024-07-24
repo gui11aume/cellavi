@@ -94,12 +94,14 @@ class plTrainHarness(pl.LightningModule):
             )
 
     def capture_params(self):
+        # just_one_cell = self.cellavi.expr[0].to(self.device)
+        # just_one_idx = torch.tensor([0]).to(self.device)
         with pyro.poutine.trace(param_only=True):
             self.elbo.differentiable_loss(
                 model=self.pyro_model,
                 guide=self.pyro_guide,
-                # Use just one cell.
-                idx=torch.tensor([0]),
+                # idx=torch.tensor([0]),
+                ddata_i=self.cellavi.ddata[0],
             )
 
     def configure_optimizers(self):
@@ -139,7 +141,8 @@ class plTrainHarness(pl.LightningModule):
             ncells = self.cellavi.ncells
             bsz = self.cellavi.bsz
             idx = torch.randperm(ncells)[:bsz].sort().values
-            X = denslice(self.cellavi.X, idx).to(self.cellavi.device)
+            ddata_i = self.cellavi.ddata[idx]
+            X = ddata_i.x.to(self.device)
             sys.stderr.write("Initializing parameters...\n")
             self.cellavi.initialize_locals()
 
@@ -149,7 +152,7 @@ class plTrainHarness(pl.LightningModule):
                 pyro.set_rng_seed(seed)
                 self.cellavi.initialize_parameters(X)
                 with torch.inference_mode():
-                    loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
+                    loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, ddata_i)
                 losses.append(float(loss))
 
             # Initialize the model with the best seed.
@@ -165,22 +168,11 @@ class plTrainHarness(pl.LightningModule):
                 self.log_theta_i_loc = list()
                 self.log_theta_i_scale = list()
 
-    def validation_step(self, batch):
-        # This is exactly the same as the training step.
-        idx = batch.sort().values
-        loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
-        learning_rates = self.lr_schedulers().get_last_lr()
-        info = {"loss": loss, "lr": learning_rates[0]}
-        self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
-        self.cellavi.training_steps_performed = self.trainer.global_step
-        return loss
-
     def training_step(self, batch):
         # Note: sorting the indices of the subsample is critical because
         # Pyro messengers subsample in sorted order. Without this line,
         # the parameters are completely randomized in the guide.
-        idx = batch.sort().values
-        loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
+        loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
         learning_rates = self.lr_schedulers().get_last_lr()
         info = {"loss": loss, "lr": learning_rates[0]}
         self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
@@ -191,12 +183,12 @@ class plTrainHarness(pl.LightningModule):
         if self.cellavi.amortize is False:
             warnings.warn("Amortization is disabled.")
             return
-        # Use amortizer on `self.X` to compute `log_theta_i_loc` and `log_theta_i_scale`.
-        idx = batch.sort().values
-        x_i = denslice(self.cellavi.X, idx).to(self.cellavi.device)
-        ohb_i = subset(F.one_hot(self.cellavi.batch), idx)
-        ohc_i = subset(F.one_hot(self.cellavi.ctype), idx)
-        ohg_i = subset(F.one_hot(self.cellavi.group), idx)
+        # Use amortizer data to compute `log_theta_i_loc` and `log_theta_i_scale`.
+        idx = batch.idx_i
+        x_i = batch.x.to(self.cellavi.device)
+        ohb_i = subset(F.one_hot(self.cellavi.ddata.batch), idx)
+        ohc_i = subset(F.one_hot(self.cellavi.ddata.ctype), idx)
+        ohg_i = subset(F.one_hot(self.cellavi.ddata.group), idx)
         freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
         # Keep only top genes.
         freq_i = freq_i[:, self.cellavi.topG]
@@ -249,26 +241,13 @@ class InferenceNetwork(pyro.nn.PyroModule):
 
 
 class Cellavi(pyro.nn.PyroModule):
-    def __init__(self, data, collapse=True, amortize=True, freeze=set(), device=None):
+    def __init__(self, X, ddata, collapse=True, amortize=True, freeze=set(), device="cuda:0"):
         super().__init__()
 
-        # Unpack data.
-        (self.ctype, self.batch, self.group, self.label, self.X, masks) = data
-        (self.cmask, self.smask) = masks
+        self.ddata = ddata
 
-        # FIXME: disallow unknown cell types??
-        assert self.cmask.all()
-
-        self.one_hot_ctype = F.one_hot(self.ctype, num_classes=C).float()
-        self.one_hot_batch = F.one_hot(self.batch, num_classes=B).float()
-        # Format observed labels. Create one-hot encoding with label smoothing.
-        # Assign values so that the probability of the provided label is 0.95.
-        a = 1.472219 + 0.5 * math.log(K - 1)
-        self.one_hot_label = F.one_hot(self.label, num_classes=K)
-        self.slabel = 2 * a * self.one_hot_label - a if K > 1 else self.one_hot_label
-
-        self.device = device if device is not None else self.X.device
-        self.ncells = int(self.X.shape[0])
+        self.device = device
+        self.ncells = int(self.ddata.x.shape[0])
 
         self.bsz = self.ncells if self.ncells < SUBSMPL else SUBSMPL
 
@@ -302,7 +281,7 @@ class Cellavi(pyro.nn.PyroModule):
         else:
             self.output_ctype_fx = self.sample_ctype_fx
             self.collect_ctype_fx_i = self.compute_ctype_fx_i_no_enum
-            if self.cmask.all():
+            if ddata.cmask.all():
                 # All cell types are known.
                 self.need_to_infer_cell_type = False
                 self.output_c_indx = self.return_ctype_as_is
@@ -322,13 +301,13 @@ class Cellavi(pyro.nn.PyroModule):
         # Instantiate parameters now. Note that redefining `self.autonormal`
         # will destroy the current parameters of the autoguide.
         # TODO: test if this is really useful (doing something).
-        self.autonormal._setup_prototype(idx=torch.tensor([0]))  # Just one cell.
+        self.autonormal._setup_prototype(self.ddata[0])
 
         # 4) Find the top 2048 most variable genes.
         rnd_yesno = torch.zeros(self.ncells, dtype=torch.bool).to(self.device)
         rnd_yesno[:65536] = True
         rnd_yesno = rnd_yesno[torch.randperm(self.ncells)]
-        subX = denslice(self.X, rnd_yesno).to(self.device)
+        subX = denslice(self.ddata.x, rnd_yesno).to(self.device)
         freq = subX / subX.sum(dim=-1, keepdim=True)
         self.topG = freq.std(dim=0).sort(descending=True).indices[:2048]
 
@@ -361,10 +340,10 @@ class Cellavi(pyro.nn.PyroModule):
             ctype_profile = 0.5 * torch.ones(C, G).to(self.device)
             for i in range(0, self.ncells, SUBSMPL):
                 idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-                x_i = denslice(self.X, idx).to(self.device)
+                x_i = denslice(self.ddata.x, idx).to(self.device)
                 # Remove cells without known type.
-                x_i[~self.cmask[idx]] = 0.0
-                ctype_profile += torch.einsum("iG,iC->CG", x_i, self.one_hot_ctype[idx])
+                x_i[~self.ddata.cmask[idx]] = 0.0
+                ctype_profile += torch.einsum("iG,iC->CG", x_i, self.ddata.one_hot_ctype[idx])
             self.ctype_profile = ctype_profile / ctype_profile.sum(dim=-1, keepdim=True)
             self.av = torch.stack([self.ctype_profile[c] for c in range(C)]).mean(dim=0)
             self.avlog = torch.log(self.av) - torch.log(self.av).mean()
@@ -377,13 +356,13 @@ class Cellavi(pyro.nn.PyroModule):
             # # Sample SUBSMPL cells at random.
             # indx_i = torch.randperm(self.ncells)[:SUBSMPL].sort().values
             # Sample SUBSMPL cells at random from labeled cells.
-            (avail,) = torch.where(self.smask)
-            indx_i = avail[torch.randperm(self.smask.sum())[:SUBSMPL].sort().values]
+            (avail,) = torch.where(self.ddata.smask)
+            indx_i = avail[torch.randperm(self.ddata.smask.sum())[:SUBSMPL].sort().values]
             # Prepare input data.
-            x_i = denslice(self.X, indx_i).to(self.device)
-            ohb_i = subset(F.one_hot(self.batch), indx_i)
-            ohc_i = subset(F.one_hot(self.ctype), indx_i)
-            ohg_i = subset(F.one_hot(self.group), indx_i)
+            x_i = denslice(self.ddata.x, indx_i).to(self.device)
+            ohb_i = subset(F.one_hot(self.ddata.batch), indx_i)
+            ohc_i = subset(F.one_hot(self.ddata.ctype), indx_i)
+            ohg_i = subset(F.one_hot(self.ddata.group), indx_i)
             freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
             # Keep only top genes.
             freq_i = freq_i[:, self.topG]
@@ -404,11 +383,11 @@ class Cellavi(pyro.nn.PyroModule):
         # 1) Get up to 65,536 cells plus all labelled cells.
         rnd_yesno = torch.zeros(self.ncells, dtype=torch.bool).to(self.device)
         rnd_yesno[:65536] = True
-        smpl_yesno = self.smask | rnd_yesno[torch.randperm(self.ncells)]
-        subX = denslice(self.X, smpl_yesno).to(self.device)
+        smpl_yesno = self.ddata.smask | rnd_yesno[torch.randperm(self.ncells)]
+        subX = denslice(self.ddata.x, smpl_yesno).to(self.device)
         freq = subX / subX.sum(dim=-1, keepdim=True)
         # 2) Subtract the cell baseline.
-        freq -= self.ctype_profile[self.ctype[smpl_yesno]]
+        freq -= self.ctype_profile[self.ddata.ctype[smpl_yesno]]
         # Keep only top genes.
         freq = freq[:, self.topG]
         # 4a) Perform PCA on the subset.
@@ -419,8 +398,8 @@ class Cellavi(pyro.nn.PyroModule):
         _, eigenvectors = torch.linalg.eigh(cov)
         proj_x = x @ eigenvectors[:, -K:]
         # 4b) Remove batch effects.
-        smpl_one_hot_batch = self.one_hot_batch[smpl_yesno]
-        batch_avg = torch.linalg.lstsq(self.one_hot_batch[smpl_yesno], proj_x).solution
+        smpl_one_hot_batch = self.ddata.one_hot_batch[smpl_yesno]
+        batch_avg = torch.linalg.lstsq(self.ddata.one_hot_batch[smpl_yesno], proj_x).solution
         proj_x -= smpl_one_hot_batch @ batch_avg
 
         # 5) Use k-means clustering to find the initial centroids.
@@ -449,19 +428,23 @@ class Cellavi(pyro.nn.PyroModule):
                 best_wcss = wcss
                 best_ctrd = ctrd
                 best_ass = ass
-        labl_ctrd = torch.zeros(K, K).to(self.device)
         # 6) Compute labelled centroids.
-        available_topic_labels = torch.unique(self.label[self.smask])
+        available_topic_labels = torch.unique(self.ddata.topic[self.ddata.smask])
+        labl_ctrd = torch.zeros(K, K).to(self.device)
         for t in available_topic_labels:
-            idx_t = (self.label[smpl_yesno] == t) & (self.smask[smpl_yesno])
+            idx_t = (self.ddata.topic[smpl_yesno] == t) & (self.ddata.smask[smpl_yesno])
             proj_t = proj_x[idx_t, :]
             labl_ctrd[t] = proj_t.mean(dim=0, keepdim=True)
-        cost_matrix = torch.cdist(labl_ctrd, best_ctrd)
-        from scipy.optimize import linear_sum_assignment
-
         # 7) match labelled centroids with k-means centroids.
-        _, matched = linear_sum_assignment(cost_matrix.cpu())
-        unmatched = set(range(K)).difference(matched)
+        if len(available_topic_labels) > 0:
+            cost_matrix = torch.cdist(labl_ctrd[available_topic_labels, :], best_ctrd)
+            from scipy.optimize import linear_sum_assignment
+
+            _, matched = linear_sum_assignment(cost_matrix.cpu())
+            unmatched = list(set(range(K)).difference(matched))
+        else:
+            matched = []
+            unmatched = range(K)
         # 8) Fit a Student's t-distribution for centroids.
         student = dict()
         i = j = 0
@@ -472,7 +455,6 @@ class Cellavi(pyro.nn.PyroModule):
             else:
                 ctrd = unmatched[j]
                 j += 1
-            # idx_t = (self.label[smpl_yesno] == t) & (self.smask[smpl_yesno])
             idx_t = best_ass == ctrd
             proj_t = proj_x[idx_t, :]
             mean_t = proj_t.mean(dim=0, keepdim=True)
@@ -488,46 +470,45 @@ class Cellavi(pyro.nn.PyroModule):
         init_value = list()
         for i in range(0, self.ncells, SUBSMPL):
             idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-            x_i = denslice(self.X, idx).to(self.device)
+            x_i = denslice(self.ddata.x, idx).to(self.device)
             freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-            freq_i -= self.ctype_profile[self.ctype[idx]]
+            freq_i -= self.ctype_profile[self.ddata.ctype[idx]]
             # Keep only top genes.
             freq_i = freq_i[:, self.topG]
             y = (freq_i - freq_mean) / freq_std
             proj_y = y @ eigenvectors[:, -K:]
             # Remove batch effects.
-            proj_y -= self.one_hot_batch[idx] @ batch_avg
+            proj_y -= self.ddata.one_hot_batch[idx] @ batch_avg
             # dim(log_p_i): SUBSMPL x K
-            log_p_i = torch.stack(
-                [
-                    (
-                        student[k].log_prob(proj_y)
-                        if k in available_topic_labels
-                        else -512 * torch.ones_like(proj_y[:, 0])
-                    )
-                    for k in range(K)
-                ]
-            ).transpose(-1, -2)
+            # log_p_i = torch.stack(
+            #    [
+            #        (
+            #            student[k].log_prob(proj_y)
+            #            if k in available_topic_labels
+            #            else -512 * torch.ones_like(proj_y[:, 0])
+            #        )
+            #        for k in range(K)
+            #    ]
+            log_p_i = torch.stack([student[k].log_prob(proj_y) for k in range(K)]).transpose(-1, -2)
             maxval_i = log_p_i.max(dim=-1).values
-            # Topic without any labels have highest probability.
-            for k in range(K):
-                if k not in available_topic_labels:
-                    log_p_i[:, k] = maxval_i
+            ## Topic without any labels have highest probability.
+            # for k in range(K):
+            #    if k not in available_topic_labels:
+            #        log_p_i[:, k] = maxval_i
             # Shift to set the highest value to 2.0.
             log_theta_i_loc = torch.clamp(log_p_i - maxval_i.unsqueeze(-1) + 2.0, min=-2.0, max=2.0)
             init_value.append(log_theta_i_loc)
         # dim(init_value): ncells x K
         init_value = torch.where(
-            self.smask.unsqueeze(-1).expand(self.ncells, K),
-            self.slabel,  # Smooth labels where available.
+            self.ddata.smask.unsqueeze(-1).expand(self.ncells, K),
+            self.ddata.stopic,  # Smooth labels where available.
             torch.cat(init_value, dim=0),
         )
-
         # Gather average topics.
-        avg_topic = torch.zeros(K, G).to(self.device)
+        avg_topic = 0.5 * torch.ones(K, G).to(self.device)
         for i in range(0, self.ncells, SUBSMPL):
             idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-            x_i = denslice(self.X, idx).to(self.device)
+            x_i = denslice(self.ddata.x, idx).to(self.device)
             wgts_i = init_value[idx].softmax(dim=-1)
             avg_topic += torch.einsum("iG,iK->KG", x_i, wgts_i)
         self.avg_topic = avg_topic / avg_topic.sum(dim=-1, keepdim=True)
@@ -570,8 +551,8 @@ class Cellavi(pyro.nn.PyroModule):
             pdb.set_trace()
             self.c_indx_probs = pyro.nn.module.PyroParam(
                 torch.where(
-                    self.cmask.unsqueeze(-1).expand(self.ncells, C),
-                    self.one_hot_ctype,
+                    self.ddata.cmask.unsqueeze(-1).expand(self.ncells, C),
+                    self.ddata.one_hot_ctype,
                     5.0 + torch.rand(self.ncells, C).to(self.device),
                 ),
                 constraint=torch.distributions.constraints.simplex,
@@ -624,7 +605,7 @@ class Cellavi(pyro.nn.PyroModule):
         guide = pyro.plate("samples", 10, dim=-3)(pyro.poutine.block(self.guide, hide=use_prior))
         model = pyro.plate("samples", 10, dim=-3)(pyro.poutine.block(self.model, hide=["x_i"]))
         samples = list()
-        total_counts = [int(x) for x in self.X.sum(dim=-1)]
+        total_counts = [int(x) for x in self.ddata.x.sum(dim=-1)]
         with UnconditionMessenger(sites=["x_i"]), torch.no_grad():
             # Generate 10 sample at a time.
             for _ in range(0, num_samples, 10):
@@ -861,7 +842,7 @@ class Cellavi(pyro.nn.PyroModule):
         return nu, k2
 
     #  ==  model description == #
-    def model(self, idx=None):
+    def model(self, ddata_i=None):
         with pyro.plate("C", C, dim=-2):
             # The parameter `scale_factor` describes the standard
             # deviations for every cell type from the global
@@ -926,16 +907,14 @@ class Cellavi(pyro.nn.PyroModule):
                 topics = self.output_topics()
 
         # Per-cell sampling.
+        idx = ddata_i.idx_i if ddata_i is not None else None
         with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
             # Subset data and mask.
-            one_hot_ctype_i = subset(self.one_hot_ctype, indx_i)
-            ctype_i_mask = subset(self.cmask, indx_i)
-            slabel_i = subset(self.slabel, indx_i)
-            slabel_i_mask = subset(self.smask, indx_i)
-            x_i = denslice(self.X, indx_i).to(self.device)
-
-            # Cell types as discrete indicators. The prior
-            # distiribution is uniform over known cell types.
+            x_i = ddata_i.x.to(self.device)
+            one_hot_ctype_i = ddata_i.one_hot_ctype.to(self.device)
+            ctype_i_mask = ddata_i.cmask.to(self.device)
+            slabel_i = ddata_i.stopic.to(self.device)
+            slabel_i_mask = ddata_i.smask.to(self.device)
 
             # dim(c_indx): C x (P) x 1 x ncells
             one_hot_c_indx = self.output_c_indx(one_hot_ctype_i, ctype_i_mask)
@@ -955,10 +934,10 @@ class Cellavi(pyro.nn.PyroModule):
             ctype_fx_i = self.collect_ctype_fx_i(one_hot_c_indx, ctype_fx)
 
             # dim(batch_fx_i): (P) x ncells x G
-            batch_fx_i = self.collect_batch_fx_i(self.batch, batch_fx, indx_i)
+            batch_fx_i = self.collect_batch_fx_i(self.ddata.batch, batch_fx, indx_i)
 
             # dim(topics_i): (P) x ncells x G
-            topics_i = self.collect_topics_i(self.group, theta_i, topics, indx_i)
+            topics_i = self.collect_topics_i(self.ddata.group, theta_i, topics, indx_i)
 
             # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
@@ -1031,25 +1010,30 @@ class Cellavi(pyro.nn.PyroModule):
                 )
 
     #  ==  guide description == #
-    def guide(self, idx=None):
+    def guide(self, ddata_i=None):
         # Sample all non-cell variables.
-        self.autonormal(idx)
+        self.autonormal(ddata_i)
 
         # Per-cell sampling
-        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
-            x_i = denslice(self.X, indx_i).to(self.device)
+        idx = ddata_i.idx_i if ddata_i is not None else None
+        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device):
+            x_i = ddata_i.x.to(self.device)
             # TODO: find canonical way to enter context of the module.
             self._pyro_context.active += 1
 
             # Subset data and mask.
-            ctype_i_mask = subset(self.cmask, indx_i)
+            # ctype_i_mask = subset(self.ddata.cmask, indx_i)
+            ctype_i_mask = ddata_i.cmask.to(self.device)
 
             # Get topic-breakdown parameters by either calling the amortizer
             # on the input data or by pulling learnable parameters.
             if self.amortize is True:
-                ohb_i = subset(F.one_hot(self.batch), indx_i)
-                ohc_i = subset(F.one_hot(self.ctype), indx_i)
-                ohg_i = subset(F.one_hot(self.group), indx_i)
+                # ohb_i = subset(F.one_hot(self.ddata.batch), indx_i)
+                # ohc_i = subset(F.one_hot(self.ddata.ctype), indx_i)
+                # ohg_i = subset(F.one_hot(self.ddata.group), indx_i)
+                ohb_i = ddata_i.one_hot_batch.to(self.device)
+                ohc_i = ddata_i.one_hot_ctype.to(self.device)
+                ohg_i = ddata_i.one_hot_group.to(self.device)
                 freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
                 # Keep only top genes.
                 freq_i = freq_i[:, self.topG]
