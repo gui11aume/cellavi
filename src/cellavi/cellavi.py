@@ -1,5 +1,4 @@
 import math
-import sys
 import warnings
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +7,7 @@ import pyro
 import pyro.distributions as dist
 import torch
 import torch.nn.functional as F
+from cellavi_initializer import initialize_parameters
 from pyro.infer.autoguide import AutoNormal
 from scipy.sparse import csr_matrix
 
@@ -137,28 +137,10 @@ class plTrainHarness(pl.LightningModule):
 
     def setup(self, stage=None):
         if stage == "fit":
-            # Create the initialization dataset.
-            ncells = self.cellavi.ncells
-            bsz = self.cellavi.bsz
-            idx = torch.randperm(ncells)[:bsz].sort().values
-            ddata_i = self.cellavi.ddata[idx]
-            X = ddata_i.x.to(self.device)
-            sys.stderr.write("Initializing parameters...\n")
-            self.cellavi.initialize_locals()
-
-            sys.stderr.write("Optimizing initial conditions...\n")
-            losses = list()
-            for seed in range(512):
-                pyro.set_rng_seed(seed)
-                self.cellavi.initialize_parameters(X)
-                with torch.inference_mode():
-                    loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, ddata_i)
-                losses.append(float(loss))
-
-            # Initialize the model with the best seed.
-            _, seed = min([(x, i) for (i, x) in enumerate(losses)])
-            pyro.set_rng_seed(seed)
-            self.cellavi.initialize_parameters(X)
+            with torch.device(self.cellavi.device):
+                data = self.cellavi.ddata
+                amortizer = self.cellavi.amortizer
+                initialize_parameters(data, amortizer)
 
             # Instantiate parameters of autoguides.
             self.capture_params()
@@ -184,14 +166,11 @@ class plTrainHarness(pl.LightningModule):
             warnings.warn("Amortization is disabled.")
             return
         # Use amortizer data to compute `log_theta_i_loc` and `log_theta_i_scale`.
-        idx = batch.idx_i
         x_i = batch.x.to(self.cellavi.device)
-        ohb_i = subset(F.one_hot(self.cellavi.ddata.batch), idx)
-        ohc_i = subset(F.one_hot(self.cellavi.ddata.ctype), idx)
-        ohg_i = subset(F.one_hot(self.cellavi.ddata.group), idx)
+        ohb_i = batch.one_hot_batch
+        ohc_i = batch.one_hot_ctype
+        ohg_i = batch.one_hot_group
         freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-        # Keep only top genes.
-        freq_i = freq_i[:, self.cellavi.topG]
         bcgf_i = torch.cat([ohb_i, ohc_i, ohg_i, freq_i], dim=-1)
         loc_i, scale_i = self.cellavi.amortizer(bcgf_i)
         self.log_theta_i_loc.append(loc_i)
@@ -294,7 +273,6 @@ class Cellavi(pyro.nn.PyroModule):
         self.frozen = freeze
 
         # 3) Instantiate autoguide.
-        sys.stderr.write("Instantiating guide...\n")
         # Local variables must be hidden because they are defined in the guide.
         local_variables = ["log_theta_i", "ctype_i_unobserved", "z_i", "x_i"]
         self.autonormal = AutoNormal(pyro.poutine.block(self.model, hide=local_variables))
@@ -303,232 +281,15 @@ class Cellavi(pyro.nn.PyroModule):
         # TODO: test if this is really useful (doing something).
         self.autonormal._setup_prototype(self.ddata[0])
 
-        # 4) Find the top 2048 most variable genes.
-        rnd_yesno = torch.zeros(self.ncells, dtype=torch.bool).to(self.device)
-        rnd_yesno[:65536] = True
-        rnd_yesno = rnd_yesno[torch.randperm(self.ncells)]
-        subX = denslice(self.ddata.x, rnd_yesno).to(self.device)
-        freq = subX / subX.sum(dim=-1, keepdim=True)
-        self.topG = freq.std(dim=0).sort(descending=True).indices[:2048]
-
-        # 5) Instantiate inference network
+        # 4) Instantiate inference network
         if self.amortize is True:
             self.amortizer = InferenceNetwork(
                 # Make space for batch, cell type, and group.
-                input_size=len(self.topG) + B + C + R,
+                input_size=G + B + C + R,
                 hidden_size=128,
                 output_size=K,
                 dropout_rate=0.3,
             ).to(self.device)
-
-        # 5) Create a bank of labelled cells.
-        sys.stderr.write("Gathering average profiles...\n")
-        self.gather_average_profiles()
-
-    def freeze(self, param):
-        self.frozen.add(param)
-
-    def unfreeze(self, param):
-        self.frozen.remove(param)
-
-    def gather_average_profiles(self):
-        if C == 1:
-            self.ctype_profile = torch.zeros(C, G).to(self.device)
-            self.avlog = torch.zeros(1, G).to(self.device)
-        else:
-            # Add 1/2 pseudo-count.
-            ctype_profile = 0.5 * torch.ones(C, G).to(self.device)
-            for i in range(0, self.ncells, SUBSMPL):
-                idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-                x_i = denslice(self.ddata.x, idx).to(self.device)
-                # Remove cells without known type.
-                x_i[~self.ddata.cmask[idx]] = 0.0
-                ctype_profile += torch.einsum("iG,iC->CG", x_i, self.ddata.one_hot_ctype[idx])
-            self.ctype_profile = ctype_profile / ctype_profile.sum(dim=-1, keepdim=True)
-            self.av = torch.stack([self.ctype_profile[c] for c in range(C)]).mean(dim=0)
-            self.avlog = torch.log(self.av) - torch.log(self.av).mean()
-
-    def pretrain_amortizer(self, init_value):
-        # Use a simple training loop to optimize the amortizer.
-        optimizer = torch.optim.Adam(self.amortizer.parameters(), lr=0.01)
-        # Train for 256 batches.
-        for _ in range(256):
-            # # Sample SUBSMPL cells at random.
-            # indx_i = torch.randperm(self.ncells)[:SUBSMPL].sort().values
-            # Sample SUBSMPL cells at random from labeled cells.
-            (avail,) = torch.where(self.ddata.smask)
-            indx_i = avail[torch.randperm(self.ddata.smask.sum())[:SUBSMPL].sort().values]
-            # Prepare input data.
-            x_i = denslice(self.ddata.x, indx_i).to(self.device)
-            ohb_i = subset(F.one_hot(self.ddata.batch), indx_i)
-            ohc_i = subset(F.one_hot(self.ddata.ctype), indx_i)
-            ohg_i = subset(F.one_hot(self.ddata.group), indx_i)
-            freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-            # Keep only top genes.
-            freq_i = freq_i[:, self.topG]
-            bcgf_i = torch.cat([ohb_i, ohc_i, ohg_i, freq_i], dim=-1)
-            optimizer.zero_grad()
-            loc, scale = self.amortizer(bcgf_i)
-            # Compute MSD loss.
-            l2_loss = torch.nn.MSELoss()
-            loss = l2_loss(loc, init_value[indx_i]) + l2_loss(scale, 0.1 * torch.ones_like(scale))
-            # loss = -dist.Normal(loc, scale).log_prob(init_value[indx_i]).mean()
-            loss.backward()
-            optimizer.step()
-
-    def initialize_locals(self):
-        # Find target values for `log_theta_loc_i`. Use them as initial values
-        # when amortization is disabled, otherwise use them as targets for the
-        # amortizer.
-        # 1) Get up to 65,536 cells plus all labelled cells.
-        rnd_yesno = torch.zeros(self.ncells, dtype=torch.bool).to(self.device)
-        rnd_yesno[:65536] = True
-        smpl_yesno = self.ddata.smask | rnd_yesno[torch.randperm(self.ncells)]
-        subX = denslice(self.ddata.x, smpl_yesno).to(self.device)
-        freq = subX / subX.sum(dim=-1, keepdim=True)
-        # 2) Subtract the cell baseline.
-        freq -= self.ctype_profile[self.ddata.ctype[smpl_yesno]]
-        # Keep only top genes.
-        freq = freq[:, self.topG]
-        # 4a) Perform PCA on the subset.
-        freq_mean = freq.mean(dim=0, keepdim=True)
-        freq_std = freq.std(dim=0, keepdim=True)
-        x = (freq - freq_mean) / freq_std
-        cov = torch.inner(x.T, x.T) / x.shape[0]
-        _, eigenvectors = torch.linalg.eigh(cov)
-        proj_x = x @ eigenvectors[:, -K:]
-        # 4b) Remove batch effects.
-        smpl_one_hot_batch = self.ddata.one_hot_batch[smpl_yesno]
-        batch_avg = torch.linalg.lstsq(self.ddata.one_hot_batch[smpl_yesno], proj_x).solution
-        proj_x -= smpl_one_hot_batch @ batch_avg
-
-        # 5) Use k-means clustering to find the initial centroids.
-        def compute_wcss(X, centroids, cluster_assignments):
-            wcss = 0.0
-            for k in range(K):
-                cluster_points = X[cluster_assignments == k]
-                if cluster_points.size(0) > 0:
-                    wcss += ((cluster_points - centroids[k]) ** 2).sum()
-            return wcss
-
-        best_wcss = float("inf")
-        for _ in range(100):
-            indices = torch.randperm(proj_x.shape[0])[:K]
-            ctrd = proj_x[indices]
-            for i in range(35):
-                distances = torch.cdist(proj_x, ctrd)
-                ass = torch.argmin(distances, dim=1)
-                new_ctrd = torch.stack([proj_x[ass == k].mean(dim=0) for k in range(K)])
-                if torch.all(ctrd == new_ctrd):
-                    break
-                ctrd = new_ctrd
-            # Compute WCSS for the current clustering
-            wcss = compute_wcss(proj_x, ctrd, ass)
-            if wcss < best_wcss:
-                best_wcss = wcss
-                best_ctrd = ctrd
-                best_ass = ass
-        # 6) Compute labelled centroids.
-        available_topic_labels = torch.unique(self.ddata.topic[self.ddata.smask])
-        labl_ctrd = torch.zeros(K, K).to(self.device)
-        for t in available_topic_labels:
-            idx_t = (self.ddata.topic[smpl_yesno] == t) & (self.ddata.smask[smpl_yesno])
-            proj_t = proj_x[idx_t, :]
-            labl_ctrd[t] = proj_t.mean(dim=0, keepdim=True)
-        # 7) match labelled centroids with k-means centroids.
-        if len(available_topic_labels) > 0:
-            cost_matrix = torch.cdist(labl_ctrd[available_topic_labels, :], best_ctrd)
-            from scipy.optimize import linear_sum_assignment
-
-            _, matched = linear_sum_assignment(cost_matrix.cpu())
-            unmatched = list(set(range(K)).difference(matched))
-        else:
-            matched = []
-            unmatched = range(K)
-        # 8) Fit a Student's t-distribution for centroids.
-        student = dict()
-        i = j = 0
-        for t in range(K):
-            if t in available_topic_labels:
-                ctrd = matched[i]
-                i += 1
-            else:
-                ctrd = unmatched[j]
-                j += 1
-            idx_t = best_ass == ctrd
-            proj_t = proj_x[idx_t, :]
-            mean_t = proj_t.mean(dim=0, keepdim=True)
-            cov_t = torch.inner((proj_t - mean_t).T, (proj_t - mean_t).T) / proj_t.shape[0]
-            # Tikhonov regularization.
-            cov_t += 1e-6 * torch.eye(K).to(self.device)
-            student[int(t)] = pyro.distributions.MultivariateStudentT(
-                df=1.0,  # Equivalent to Cauchy distribution.
-                loc=mean_t.squeeze(-1),
-                scale_tril=torch.linalg.cholesky(cov_t),
-            )
-        # 7) Assign potential clusters to every cell.
-        init_value = list()
-        for i in range(0, self.ncells, SUBSMPL):
-            idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-            x_i = denslice(self.ddata.x, idx).to(self.device)
-            freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-            freq_i -= self.ctype_profile[self.ddata.ctype[idx]]
-            # Keep only top genes.
-            freq_i = freq_i[:, self.topG]
-            y = (freq_i - freq_mean) / freq_std
-            proj_y = y @ eigenvectors[:, -K:]
-            # Remove batch effects.
-            proj_y -= self.ddata.one_hot_batch[idx] @ batch_avg
-            # dim(log_p_i): SUBSMPL x K
-            # log_p_i = torch.stack(
-            #    [
-            #        (
-            #            student[k].log_prob(proj_y)
-            #            if k in available_topic_labels
-            #            else -512 * torch.ones_like(proj_y[:, 0])
-            #        )
-            #        for k in range(K)
-            #    ]
-            log_p_i = torch.stack([student[k].log_prob(proj_y) for k in range(K)]).transpose(-1, -2)
-            maxval_i = log_p_i.max(dim=-1).values
-            ## Topic without any labels have highest probability.
-            # for k in range(K):
-            #    if k not in available_topic_labels:
-            #        log_p_i[:, k] = maxval_i
-            # Shift to set the highest value to 2.0.
-            log_theta_i_loc = torch.clamp(log_p_i - maxval_i.unsqueeze(-1) + 2.0, min=-2.0, max=2.0)
-            init_value.append(log_theta_i_loc)
-        # dim(init_value): ncells x K
-        init_value = torch.where(
-            self.ddata.smask.unsqueeze(-1).expand(self.ncells, K),
-            self.ddata.stopic,  # Smooth labels where available.
-            torch.cat(init_value, dim=0),
-        )
-        # Gather average topics.
-        avg_topic = 0.5 * torch.ones(K, G).to(self.device)
-        for i in range(0, self.ncells, SUBSMPL):
-            idx = torch.arange(self.ncells)[i : i + SUBSMPL]
-            x_i = denslice(self.ddata.x, idx).to(self.device)
-            wgts_i = init_value[idx].softmax(dim=-1)
-            avg_topic += torch.einsum("iG,iK->KG", x_i, wgts_i)
-        self.avg_topic = avg_topic / avg_topic.sum(dim=-1, keepdim=True)
-
-        if self.amortize is True:
-            sys.stderr.write("Pretraining amortizer...\n")
-            self.pretrain_amortizer(init_value)
-        else:
-            # When amortization is disabled, we need to instantiate and
-            # initialize the topic-breakdown parameters `log_theta_i_loc`
-            # and `log_theta_i_scale`.
-            self.log_theta_i_loc = pyro.nn.module.PyroParam(
-                init_value,
-                event_dim=1,
-            )
-            self.log_theta_i_scale = pyro.nn.module.PyroParam(
-                torch.ones(self.ncells, K).to(self.device),
-                constraint=torch.distributions.constraints.positive,
-                event_dim=1,
-            )
 
         # When collapsed variational inference is disabled, we need to
         # instantiate and initialize the latent parameters of the
@@ -542,54 +303,11 @@ class Cellavi(pyro.nn.PyroModule):
                 event_dim=0,
             )
 
-        if self.need_to_infer_cell_type:
-            # Initialize `c_indx_probs` randomly for cells where the
-            # type is unknown, otherwise initialize with known type.
-            # cdist = list()
-            import pdb
+    def freeze(self, param):
+        self.frozen.add(param)
 
-            pdb.set_trace()
-            self.c_indx_probs = pyro.nn.module.PyroParam(
-                torch.where(
-                    self.ddata.cmask.unsqueeze(-1).expand(self.ncells, C),
-                    self.ddata.one_hot_ctype,
-                    5.0 + torch.rand(self.ncells, C).to(self.device),
-                ),
-                constraint=torch.distributions.constraints.simplex,
-                event_dim=1,
-            )
-
-    def initialize_parameters(self, subX):
-        # 1) Initalize the amortizer.
-        if self.amortize is True:
-            for name, module in self.amortizer.named_modules():
-                if isinstance(module, pyro.nn.PyroModule[torch.nn.Linear]):
-                    torch.nn.init.xavier_uniform_(module.weight.data)
-
-        # 2) Initialize global parameters.
-        param_store = pyro.get_param_store()
-
-        if "global_base" not in self.frozen:
-            param_store["autonormal.locs.global_base"] = self.avlog
-
-        if "ctype_fx" not in self.frozen and C > 1:
-            # Initialize randomly from the data. Take the average of
-            # two cells in order to avoid picking outliers as centroids.
-            idx = torch.multinomial(torch.ones(subX.shape[0]), 2 * C)
-            two_cells = 0.5 * (subX[idx][:C] + subX[idx][C:]) + 0.5
-            ctype_fx = torch.log(two_cells) - self.avlog
-            for ctype in range(C):
-                # Pick type average with probability 0.9, otherwise keep random pair.
-                if torch.rand(1).item() < 0.9:
-                    average = self.ctype_profile[int(ctype)]
-                    ctype_fx[int(ctype)] = torch.log(average) - self.avlog
-            ctype_fx -= ctype_fx.mean(dim=-1, keepdim=True)
-            param_store["autonormal.locs.ctype_fx"] = ctype_fx
-
-        if "topics_KR" not in self.frozen:
-            topics_KR = self.avg_topic.log() - self.avlog
-            topics_KR -= topics_KR.mean(dim=-1, keepdim=True)
-            param_store["autonormal.locs.topics_KR"] = topics_KR
+    def unfreeze(self, param):
+        self.frozen.remove(param)
 
     #  == Resample ==  #
     def resample(self, num_samples=200, sample_z_from_posterior=False):
@@ -743,7 +461,7 @@ class Cellavi(pyro.nn.PyroModule):
         theta_i = log_theta_i.softmax(dim=-1)
         return theta_i
 
-    def compute_ctype_fx_i_enum(self, c_indx, ctype_fx):
+    def compute_ctype_fx_i_enum(self, ctype_fx, c_indx):
         # dim(c_indx): z x ncells x C (z = 1 or C)
         c_indx = c_indx.view((c_indx.shape[0],) + c_indx.shape[-2:])
         # dim(ctype_fx_i): z x (P) x ncells x G (z = 1 or C)
@@ -754,26 +472,26 @@ class Cellavi(pyro.nn.PyroModule):
 
     def compute_ctype_fx_i_no_enum(self, c_indx, ctype_fx):
         # dim(ctype_fx_i): (P) x ncells x G
-        ctype_fx_i = torch.einsum("...CG,nC->...nG", ctype_fx, c_indx)
+        ctype_fx_i = torch.einsum("...CG,nC->...nG", c_indx, ctype_fx)
         return ctype_fx_i
 
-    def compute_batch_fx_i(self, batch, batch_fx, indx_i):
+    def compute_batch_fx_i(self, batch_fx, one_hot_batch_i):
         # dim(ohg): ncells x B
-        ohb = subset(F.one_hot(batch).to(batch_fx), indx_i)
+        # ohb = subset(F.one_hot(batch).to(batch_fx), indx_i)
         # dim(batch_fx_i): (P) x ncells x G
-        batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, ohb)
+        batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, one_hot_batch_i)
         return batch_fx_i
 
-    def compute_topics_i(self, group, theta_i, topics, indx_i, PoE=False):
+    def compute_topics_i(self, one_hot_group_i, theta_i, topics, PoE=False):
         # dim(ohg): ncells x R
-        ohg = subset(F.one_hot(group).to(topics.dtype), indx_i)
+        # ohg = subset(F.one_hot(group).to(topics.dtype), indx_i)
         # dim(topics_i): (P) x ncells x G
         if PoE:
             # This is the product-of-experts distribution.
-            topics_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, topics, ohg)
+            topics_i = torch.einsum("...onK,...KRG,nR->...nG", theta_i, topics, one_hot_group_i)
         else:
             # This is the mixture distribution.
-            topics_ = torch.einsum("...KRG,nR->...nKG", topics, ohg)
+            topics_ = torch.einsum("...KRG,nR->...nKG", topics, one_hot_group_i)
             log_theta = theta_i.log().squeeze(-3).unsqueeze(-1)
             topics_i = torch.logsumexp(log_theta + topics_, dim=-2)
         return topics_i
@@ -908,10 +626,12 @@ class Cellavi(pyro.nn.PyroModule):
 
         # Per-cell sampling.
         idx = ddata_i.idx_i if ddata_i is not None else None
-        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device) as indx_i:
+        with pyro.plate("ncells", self.ncells, dim=-1, subsample=idx, device=self.device):
             # Subset data and mask.
             x_i = ddata_i.x.to(self.device)
             one_hot_ctype_i = ddata_i.one_hot_ctype.to(self.device)
+            one_hot_batch_i = ddata_i.one_hot_batch.to(self.device)
+            one_hot_group_i = ddata_i.one_hot_group.to(self.device)
             ctype_i_mask = ddata_i.cmask.to(self.device)
             slabel_i = ddata_i.stopic.to(self.device)
             slabel_i_mask = ddata_i.smask.to(self.device)
@@ -931,13 +651,13 @@ class Cellavi(pyro.nn.PyroModule):
             # Deterministic functions to collect per-cell means.
 
             # dim(ctype_fx_i): C x (P) x ncells x G
-            ctype_fx_i = self.collect_ctype_fx_i(one_hot_c_indx, ctype_fx)
+            ctype_fx_i = self.collect_ctype_fx_i(ctype_fx, one_hot_c_indx)
 
             # dim(batch_fx_i): (P) x ncells x G
-            batch_fx_i = self.collect_batch_fx_i(self.ddata.batch, batch_fx, indx_i)
+            batch_fx_i = self.collect_batch_fx_i(batch_fx, one_hot_batch_i)
 
             # dim(topics_i): (P) x ncells x G
-            topics_i = self.collect_topics_i(self.ddata.group, theta_i, topics, indx_i)
+            topics_i = self.collect_topics_i(one_hot_group_i, theta_i, topics)
 
             # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
@@ -1035,8 +755,6 @@ class Cellavi(pyro.nn.PyroModule):
                 ohc_i = ddata_i.one_hot_ctype.to(self.device)
                 ohg_i = ddata_i.one_hot_group.to(self.device)
                 freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
-                # Keep only top genes.
-                freq_i = freq_i[:, self.topG]
                 bcgf_i = torch.cat([ohb_i, ohc_i, ohg_i, freq_i], dim=-1)
                 (log_theta_i_loc, log_theta_i_scale) = self.amortizer(bcgf_i)
             else:
