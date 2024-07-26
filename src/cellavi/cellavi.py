@@ -1,6 +1,6 @@
 import math
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import lightning.pytorch as pl
 import pyro
@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from cellavi_initializer import initialize_parameters
 from pyro.infer.autoguide import AutoNormal
-from scipy.sparse import csr_matrix
 
 global K  # Number of topics
 global B  # Number of batches
@@ -33,22 +32,6 @@ MIN_NUM_EPOCHS = 24
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
-
-
-def subset(tensor: Optional[torch.Tensor], idx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if idx is None:
-        return tensor
-    if tensor is None:
-        return None
-    return tensor.index_select(0, idx.to(tensor.device))
-
-
-def denslice(array: csr_matrix, idx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if idx is None:
-        return torch.tensor(array.todense())
-    if array is None:
-        return None
-    return torch.tensor(array[idx.cpu(), :].todense())
 
 
 class UnconditionMessenger(pyro.poutine.messenger.Messenger):
@@ -220,10 +203,11 @@ class InferenceNetwork(pyro.nn.PyroModule):
 
 
 class Cellavi(pyro.nn.PyroModule):
-    def __init__(self, X, ddata, collapse=True, amortize=True, freeze=set(), device="cuda:0"):
+    def __init__(self, ddata, PoE=False, collapse=True, amortize=True, freeze=set(), device="cuda:0"):
         super().__init__()
 
         self.ddata = ddata
+        self.PoE = PoE
 
         self.device = device
         self.ncells = int(self.ddata.x.shape[0])
@@ -476,15 +460,11 @@ class Cellavi(pyro.nn.PyroModule):
         return ctype_fx_i
 
     def compute_batch_fx_i(self, batch_fx, one_hot_batch_i):
-        # dim(ohg): ncells x B
-        # ohb = subset(F.one_hot(batch).to(batch_fx), indx_i)
         # dim(batch_fx_i): (P) x ncells x G
         batch_fx_i = torch.einsum("...BG,nB->...nG", batch_fx, one_hot_batch_i)
         return batch_fx_i
 
     def compute_topics_i(self, one_hot_group_i, theta_i, topics, PoE=False):
-        # dim(ohg): ncells x R
-        # ohg = subset(F.one_hot(group).to(topics.dtype), indx_i)
         # dim(topics_i): (P) x ncells x G
         if PoE:
             # This is the product-of-experts distribution.
@@ -657,7 +637,7 @@ class Cellavi(pyro.nn.PyroModule):
             batch_fx_i = self.collect_batch_fx_i(batch_fx, one_hot_batch_i)
 
             # dim(topics_i): (P) x ncells x G
-            topics_i = self.collect_topics_i(one_hot_group_i, theta_i, topics)
+            topics_i = self.collect_topics_i(one_hot_group_i, theta_i, topics, PoE=self.PoE)
 
             # Expected expression of genes in log space.
             # dim(mu_i): (P) x ncells x G
@@ -742,15 +722,11 @@ class Cellavi(pyro.nn.PyroModule):
             self._pyro_context.active += 1
 
             # Subset data and mask.
-            # ctype_i_mask = subset(self.ddata.cmask, indx_i)
             ctype_i_mask = ddata_i.cmask.to(self.device)
 
             # Get topic-breakdown parameters by either calling the amortizer
             # on the input data or by pulling learnable parameters.
             if self.amortize is True:
-                # ohb_i = subset(F.one_hot(self.ddata.batch), indx_i)
-                # ohc_i = subset(F.one_hot(self.ddata.ctype), indx_i)
-                # ohg_i = subset(F.one_hot(self.ddata.group), indx_i)
                 ohb_i = ddata_i.one_hot_batch.to(self.device)
                 ohc_i = ddata_i.one_hot_ctype.to(self.device)
                 ohg_i = ddata_i.one_hot_group.to(self.device)

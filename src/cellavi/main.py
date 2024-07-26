@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--data_path", type=str, required=True, help="path to data file")
     parser.add_argument("--meta_path", type=str, help="path to metadata file")
     parser.add_argument("--out_path", type=str, required=True, help="path to output file")
+    parser.add_argument("--product_of_experts", action="store_true", help="use product of expert")
     parser.add_argument("--device", type=str, default="cuda:0", help="'cpu', 'cuda', 'cuda:0', ... (default: 'cuda:0')")
     parser.add_argument("--parameters", type=str, help="path to file with parameters (optional)")
     parser.add_argument(
@@ -67,6 +68,8 @@ def main():
     if (args.C > 0) and (args.C < len(ctmap)):
         sys.exit("-C is less than the number of existing cell types")
 
+    PoE = args.product_of_experts
+
     #######################################################
 
     if args.parameters is not None:
@@ -97,7 +100,7 @@ def main():
         R=cellavi.R,
     )
 
-    model = Cellavi(X=X, ddata=ddata, device=device)
+    model = Cellavi(ddata=ddata, PoE=PoE, device=device)
 
     if args.mode == "sample":
         sample = model.resample().cpu()
