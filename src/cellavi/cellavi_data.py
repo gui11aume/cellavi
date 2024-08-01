@@ -55,7 +55,7 @@ class CellaviData:
 
         self.one_hot_ctype = F.one_hot(self.ctype, num_classes=self.C).float()
         self.one_hot_batch = F.one_hot(self.batch, num_classes=self.B).float()
-        self.one_hot_group = F.one_hot(self.batch, num_classes=self.R).float()
+        self.one_hot_group = F.one_hot(self.group, num_classes=self.R).float()
         self.one_hot_topic = F.one_hot(self.topic, num_classes=self.K).float()
         # Format observed labels. Create one-hot encoding with label smoothing.
         # Assign values so that the probability of the provided label is 0.95.
