@@ -7,9 +7,37 @@ import pyro
 import torch
 from cellavi import Cellavi, plTrainHarness
 from cellavi_data import CellaviCollator, CellaviData
+from lightning.pytorch.callbacks import Callback
 from misc_cellavi import load_parameters, read_h5ad, read_meta_from_file, read_mtx, read_text_matrix, update_ctmap
+from tqdm.auto import tqdm
 
 SUBSMPL = 512
+
+
+class CustomProgressBar(Callback):
+    def __init__(self):
+        self.train_bar = None
+        self.val_bar = None
+
+    def on_train_start(self, trainer, pl_module):
+        self.train_bar = tqdm(total=trainer.max_epochs, position=0, desc="Training", leave=True)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        self.train_bar.update(1)
+        self.train_bar.set_description(f"Training: Epoch {trainer.current_epoch + 1}/{trainer.max_epochs}")
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if self.val_bar is None:
+            self.val_bar = tqdm(total=trainer.max_epochs, position=1, desc="Validation", leave=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        self.val_bar.update(1)
+        self.val_bar.set_description(f"Validation: Epoch {trainer.current_epoch + 1}/{trainer.max_epochs}")
+
+    def on_train_end(self, trainer, pl_module):
+        self.train_bar.close()
+        if self.val_bar:
+            self.val_bar.close()
 
 
 def main():
@@ -138,10 +166,11 @@ def main():
         accelerator="gpu" if "cuda" in device else None,
         gradient_clip_val=1.0,
         max_epochs=harnessed.compute_num_training_epochs(),
-        enable_progress_bar=True,
+        enable_progress_bar=False,
         enable_model_summary=True,
         logger=pl.loggers.CSVLogger("."),
         enable_checkpointing=False,
+        callbacks=[CustomProgressBar()],
         # enable_checkpointing=True,
     )
 

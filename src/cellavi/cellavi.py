@@ -433,6 +433,7 @@ class Cellavi(pyro.nn.PyroModule):
         ).unsqueeze(-3)
         prior_scale = torch.where(
             slabel_i_mask.unsqueeze(-1).expand(slabel_i.shape),
+            # Squeeze close to 99% for known labels.
             0.1 * torch.ones_like(slabel_i),
             1.0 * torch.ones_like(slabel_i),
         ).unsqueeze(-3)
