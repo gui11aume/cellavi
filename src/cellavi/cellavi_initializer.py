@@ -87,12 +87,13 @@ def initialize_parameters(data: CellaviData, amortizer=None):
     smpl_f = smpl_f[:, topG]
 
     # 4) Perform PCA on the subset.
+    ndim = data.K + 2  # Keep K dimensions + 2.
     smpl_f_mean = smpl_f.mean(dim=0, keepdim=True)
     smpl_f_std = smpl_f.std(dim=0, keepdim=True)
     smpl_f_norm = (smpl_f - smpl_f_mean) / smpl_f_std
     cov = smpl_f_norm.T @ smpl_f_norm / smpl_f_norm.shape[0]
     _, eigenvectors = torch.linalg.eigh(cov)
-    smpl_proj = smpl_f_norm @ eigenvectors[:, -data.K :]
+    smpl_proj = smpl_f_norm @ eigenvectors[:, -ndim:]
 
     # 5) Remove batch effects.
     smpl_one_hot_batch = smpl.one_hot_batch
@@ -100,11 +101,11 @@ def initialize_parameters(data: CellaviData, amortizer=None):
     smpl_proj -= smpl_one_hot_batch @ batch_avg
 
     # 6) Use k-means clustering to find the initial centroids.
-    ctrd, assgt = kmeans(smpl_proj, data.K)
+    ctrd, assgt = kmeans(smpl_proj, ndim)
 
     # 7) Compute labelled centroids.
     available_topic_labels = torch.unique(data.topic[data.smask])
-    labl_ctrd = torch.zeros(data.K, data.K)
+    labl_ctrd = torch.zeros(data.K, ndim)
     smpl_topic = smpl.topic
     smpl_smask = smpl.smask
     for t in available_topic_labels:
@@ -139,7 +140,7 @@ def initialize_parameters(data: CellaviData, amortizer=None):
         smpl_proj_t_c = smpl_proj_t - mean_t
         cov_t = smpl_proj_t.T @ smpl_proj_t_c / smpl_proj_t_c.shape[0]
         # Tikhonov regularization.
-        cov_t += 1e-6 * torch.eye(data.K)
+        cov_t += 1e-6 * torch.eye(ndim)
         Cauchy[int(t)] = pyro.distributions.MultivariateStudentT(
             df=1.0,  # Equivalent to Cauchy distribution.
             loc=mean_t.squeeze(-1),
@@ -157,7 +158,7 @@ def initialize_parameters(data: CellaviData, amortizer=None):
         f_i -= ctype_profiles[ctype_i]
         f_i = f_i[:, topG]
         f_i_norm = (f_i - smpl_f_mean) / smpl_f_std
-        proj_i = f_i_norm @ eigenvectors[:, -data.K :]
+        proj_i = f_i_norm @ eigenvectors[:, -ndim:]
         proj_i -= one_hot_batch_i @ batch_avg
         # dim(log_p_i): `SUBSMPL` x K
         log_p_i = torch.stack([Cauchy[k].log_prob(proj_i) for k in range(data.K)]).transpose(-1, -2)
