@@ -169,6 +169,7 @@ def main():
         enable_progress_bar=False,
         enable_model_summary=True,
         logger=pl.loggers.CSVLogger("."),
+        log_every_n_steps=1,
         enable_checkpointing=False,
         callbacks=[CustomProgressBar()],
         # enable_checkpointing=True,
