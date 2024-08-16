@@ -17,7 +17,7 @@ def denslice(array: Optional[csr_matrix], idx: Optional[torch.Tensor]) -> Option
         return torch.tensor(array.todense())
     if array is None:
         return None
-    dense_array = array[idx.cpu(), :].todense()
+    dense_array = array[idx, :].todense()
     return torch.tensor(dense_array)
 
 
@@ -71,25 +71,8 @@ class CellaviData:
         assert self.cmask.shape == torch.Size([self.ncells])
         assert self.smask.shape == torch.Size([self.ncells])
 
-    def iterate_by_chunk(self, chunk_size):
-        for i in range(0, self.ncells, chunk_size):
-            idx_i = torch.arange(self.ncells)[i : i + chunk_size]
-            # Create a placeholder object to store the data.
-            data_i = SimpleNamespace()
-            data_i.x = denslice(self.x, idx_i)
-            data_i.ctype = self.ctype[idx_i]
-            data_i.batch = self.batch[idx_i]
-            data_i.group = self.group[idx_i]
-            data_i.topic = self.topic[idx_i]
-            data_i.cmask = self.cmask[idx_i]
-            data_i.smask = self.smask[idx_i]
-            data_i.stopic = self.stopic[idx_i]
-            data_i.one_hot_ctype = self.one_hot_ctype[idx_i, :]
-            data_i.one_hot_batch = self.one_hot_batch[idx_i, :]
-            data_i.one_hot_group = self.one_hot_group[idx_i, :]
-            data_i.one_hot_topic = self.one_hot_topic[idx_i, :]
-
-            yield data_i
+    def __len__(self):
+        return self.ncells
 
     def __getitem__(self, key):
         if isinstance(key, int):
@@ -124,40 +107,36 @@ class CellaviData:
 
         return data_i
 
+    def subsample_to(self, n: int):
+        idx_i = torch.randperm(self.ncells)[:n].sort().values
+        x = self.x[idx_i]
+        ctype = self.ctype[idx_i]
+        batch = self.batch[idx_i]
+        group = self.group[idx_i]
+        topic = self.topic[idx_i]
+        cmask = self.cmask[idx_i]
+        smask = self.smask[idx_i]
+        return CellaviData(x, ctype, batch, group, topic, cmask, smask, self.chunk_size, self.K, self.C, self.B, self.R)
 
-class CellaviExpressionData:
-    def __init__(self, x: csr_matrix, chunk_size: int = SUBSMPL):
-        self.x: csr_matrix = x
-        self.ncells: int = x.shape[0]
-        self.chunk_size: int = chunk_size
+    def iterate_by_chunk(self, chunk_size):
+        for i in range(0, self.ncells, chunk_size):
+            idx_i = torch.arange(self.ncells)[i : i + chunk_size]
+            # Create a placeholder object to store the data.
+            data_i = SimpleNamespace()
+            data_i.x = denslice(self.x, idx_i)
+            data_i.ctype = self.ctype[idx_i]
+            data_i.batch = self.batch[idx_i]
+            data_i.group = self.group[idx_i]
+            data_i.topic = self.topic[idx_i]
+            data_i.cmask = self.cmask[idx_i]
+            data_i.smask = self.smask[idx_i]
+            data_i.stopic = self.stopic[idx_i]
+            data_i.one_hot_ctype = self.one_hot_ctype[idx_i, :]
+            data_i.one_hot_batch = self.one_hot_batch[idx_i, :]
+            data_i.one_hot_group = self.one_hot_group[idx_i, :]
+            data_i.one_hot_topic = self.one_hot_topic[idx_i, :]
 
-    def __iter__(self):
-        self.current = 0
-        return self
-
-    def __next__(self):
-        if self.current < self.ncells:
-            idx_i = torch.arange(self.ncells)[self.current : self.current + self.chunk_size]
-            self.current += self.chunk_size
-            return denslice(self.x, idx_i)
-        else:
-            raise StopIteration
-
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            if key < 0:  # Support negative indexing
-                key += self.ncells
-            idx_i = torch.tensor([key])
-        elif isinstance(key, slice):
-            start, stop, step = key.indices(self.ncells)
-            idx_i = torch.arange(start, stop, step)
-        elif isinstance(key, list):
-            idx_i = torch.tensor(key)
-        elif isinstance(key, torch.Tensor):
-            idx_i = key
-        else:
-            raise TypeError("Invalid argument type.")
-        return denslice(self.x, idx_i)
+            yield data_i
 
 
 class CellaviCollator:
@@ -168,6 +147,6 @@ class CellaviCollator:
         # Here, `examples` is a list of singletons. The subset
         # of indices must be kept in sorted order, otherwise
         # Pyro loses track of the associated parameters.
-        unsorted_idx = torch.stack(examples)
-        sorted_idx = unsorted_idx.sort().values
-        return self.data[sorted_idx]
+        unsorted_idx_i = torch.stack(examples)
+        sorted_idx_i = unsorted_idx_i.sort().values
+        return self.data[sorted_idx_i]
