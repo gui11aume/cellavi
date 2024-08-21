@@ -16,6 +16,7 @@ SUBSMPL = 512
 
 # Suppress the specific warning about the number of workers.
 warnings.filterwarnings("ignore", message=".*does not have many workers which may be a bottleneck.*")
+warnings.filterwarnings("ignore", message=".*The epoch parameter in `scheduler.step()` was not necessary.*")
 
 
 class CustomProgressBar(Callback):
@@ -52,7 +53,6 @@ def main():
     parser.add_argument("--meta_path", type=str, help="path to metadata file")
     parser.add_argument("--out_path", type=str, required=True, help="path to output file")
     parser.add_argument("--product_of_experts", action="store_true", help="use product of expert")
-    parser.add_argument("--device", type=str, default="cuda:0", help="'cpu', 'cuda', 'cuda:0', ... (default: 'cuda:0')")
     parser.add_argument("--parameters", type=str, help="path to file with parameters (optional)")
     parser.add_argument(
         "--mode", type=str, default="train", help="one of 'train', 'sample', 'freeze' (default: 'train')"
@@ -63,8 +63,6 @@ def main():
     pyro.clear_param_store()
     torch.set_default_dtype(torch.float32)
     torch.set_float32_matmul_precision("high")
-
-    device = args.device
 
     meta_path = args.meta_path
     data_path = args.data_path
@@ -105,7 +103,7 @@ def main():
     #######################################################
 
     if args.parameters is not None:
-        loaded_ctmap = load_parameters(args.parameters, device)
+        loaded_ctmap = load_parameters(args.parameters)
         ctmap, ctype = update_ctmap(ctmap, loaded_ctmap, ctype)
 
     # Set the dimensions.
@@ -132,7 +130,7 @@ def main():
 
     sdata = ddata.subsample_to(8192)
 
-    model = Cellavi(ddata=sdata, PoE=PoE, device=device, amortize=False, collapse=False)
+    model = Cellavi(ddata=sdata, PoE=PoE, amortize=False, collapse=False)
 
     if args.mode == "sample":
         sample = model.resample().cpu()
@@ -153,34 +151,34 @@ def main():
         collate_fn=CellaviCollator(sdata),
     )
 
-    # phase_2_data_loader = torch.utils.data.DataLoader(
-    #     dataset=torch.arange(len(ddata)),
-    #     shuffle=True,
-    #     batch_size=cellavi.SUBSMPL,
-    #     collate_fn=CellaviCollator(ddata),
-    # )
+    phase_2_data_loader = torch.utils.data.DataLoader(
+        dataset=torch.arange(len(ddata)),
+        shuffle=True,
+        batch_size=cellavi.SUBSMPL,
+        collate_fn=CellaviCollator(ddata),
+    )
 
     # The test data loader is the same dummy list of indices
     # but shuffling is turned off so that cells are processed in
     # the same order as in the input data. We also make the batch
     # size 64 times larger because we just call the amortizer
     # (no gradient updates are performed).
-    # test_data_loader = torch.utils.data.DataLoader(
-    #     dataset=torch.arange(len(ddata)),
-    #     shuffle=False,
-    #     batch_size=64 * cellavi.SUBSMPL,
-    #     collate_fn=CellaviCollator(ddata),
-    # )
+    test_data_loader = torch.utils.data.DataLoader(
+        dataset=torch.arange(len(ddata)),
+        shuffle=False,
+        batch_size=64 * cellavi.SUBSMPL,
+        collate_fn=CellaviCollator(ddata),
+    )
 
     harnessed = plTrainHarness(model)
 
     trainer_args = {
         "default_root_dir": ".",
-        "accelerator": "gpu" if "cuda" in device else None,
+        "accelerator": "gpu",
         "gradient_clip_val": 1.0,
         "max_epochs": harnessed.compute_num_training_epochs(),
         "enable_progress_bar": False,
-        "enable_model_summary": True,
+        "enable_model_summary": False,
         "logger": pl.loggers.CSVLogger("."),
         "log_every_n_steps": 1,
         "enable_checkpointing": False,
@@ -188,24 +186,22 @@ def main():
     }
 
     trainer_phase_1 = pl.Trainer(
-        # strategy=pl.strategies.DeepSpeedStrategy(stage=2),
-        strategy="ddp",
+        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
         **trainer_args,
     )
-    # trainer_phase_2 = pl.Trainer(
-    #     # strategy=pl.strategies.DeepSpeedStrategy(stage=2),
-    #     **trainer_args,
-    #     strategy="ddp",
-    # )
+    trainer_phase_2 = pl.Trainer(
+        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
+        **trainer_args,
+    )
 
     pl.seed_everything(123)
-    # # Phase 1.
+    # Phase 1.
     trainer_phase_1.fit(harnessed, phase_1_data_loader)
-    # # Phase 2.
-    # model.replace_data(ddata)
-    # model.switch_on_amortization()
-    # trainer_phase_2.fit(harnessed, phase_2_data_loader)
-    # trainer_phase_2.test(harnessed, test_data_loader)
+    # Phase 2.
+    model.switch_on_amortization()
+    model.replace_data(ddata)
+    trainer_phase_2.fit(harnessed, phase_2_data_loader)
+    trainer_phase_2.test(harnessed, test_data_loader)
 
     # Save output to file.
     param_store = pyro.get_param_store().get_state()

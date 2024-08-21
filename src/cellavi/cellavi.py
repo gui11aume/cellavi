@@ -1,4 +1,3 @@
-import math
 import warnings
 from typing import Any, Dict, List
 
@@ -25,6 +24,7 @@ G: int = -1
 
 DEBUG = False
 SUBSMPL = 512
+N_BATCHES = 512
 NUM_PARTICLES = 12
 MIN_NUM_GLOBAL_UPDATES = 2048
 MIN_NUM_EPOCHS = 24
@@ -61,6 +61,9 @@ class plTrainHarness(pl.LightningModule):
         self.pyro_guide = cellavi.guide
         self.lr = lr
 
+        self.parameters_initialized = False
+        self.optimizer_initialized = False
+
         self.elbo = pyro.infer.Trace_ELBO(
             num_particles=NUM_PARTICLES,
             vectorize_particles=True,
@@ -77,13 +80,15 @@ class plTrainHarness(pl.LightningModule):
             )
 
     def configure_model(self):
+        # The logic to use multiple GPUs would go here.
         pass
 
     def setup(self, stage=None):
-        if stage == "fit":
+        if stage == "fit" and self.parameters_initialized is False:
             initialize_parameters(self.cellavi.ddata)
             # Instantiate parameters of autoguides.
             self.capture_params()
+            self.parameters_initialized = True
 
         if stage == "test":
             if self.cellavi.amortize is True:
@@ -100,26 +105,34 @@ class plTrainHarness(pl.LightningModule):
 
         model_parameters = set(self.trainer.model.named_parameters())
         trainable_params = set([param for (name, param) in model_parameters if pick(name)])
-        optimizer = torch.optim.Adam(trainable_params, lr=0.01)
-
         n_steps = self.trainer.estimated_stepping_batches
-        n_warmup_steps = int(0.05 * n_steps)
-        n_decay_steps = int(0.95 * n_steps)
 
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=n_warmup_steps
-        )
-        decay = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.01, total_iters=n_decay_steps
-        )
-
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer=optimizer,
-            schedulers=[warmup, decay],
-            milestones=[n_warmup_steps],
-        )
-
-        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+        if self.optimizer_initialized is False:
+            self.optimizer_initialized = True
+            # Optimizer for phase 1.
+            optimizer = torch.optim.Adam(trainable_params, lr=0.01)
+            n_warmup_steps = int(0.05 * n_steps)
+            n_decay_steps = int(0.95 * n_steps)
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=n_warmup_steps
+            )
+            decay = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1.0, end_factor=0.01, total_iters=n_decay_steps
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer=optimizer,
+                schedulers=[warmup, decay],
+                milestones=[n_warmup_steps],
+            )
+            return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+        else:
+            # Optimizer for phase 2.
+            optimizer = torch.optim.Adam(trainable_params, lr=0.001)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer=optimizer,
+                lr_lambda=lambda epoch: 1.0,
+            )
+            return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         for key, value in batch.__dict__.items():
@@ -145,7 +158,7 @@ class plTrainHarness(pl.LightningModule):
             warnings.warn("Amortization is disabled.")
             return
         # Use amortizer data to compute `log_theta_i_loc` and `log_theta_i_scale`.
-        x_i = batch.x.to(self.cellavi.device)
+        x_i = batch.x
         ohb_i = batch.one_hot_batch
         ohc_i = batch.one_hot_ctype
         ohg_i = batch.one_hot_group
@@ -199,11 +212,15 @@ class InferenceNetwork(pyro.nn.PyroModule):
 
 
 class Cellavi(pyro.nn.PyroModule):
-    def __init__(self, ddata, PoE=False, collapse=True, amortize=True, freeze=set(), device="cuda:0"):
+    def __init__(
+        self,
+        ddata,
+        PoE=False,
+        collapse=True,
+        amortize=True,
+        freeze=set(),
+    ):
         super().__init__()
-
-        # Use a dummy tensor to keep track of the current device.
-        self.flag = torch.zeros(1, requires_grad=False)
 
         self.ddata = ddata
         self.PoE = PoE
@@ -215,7 +232,7 @@ class Cellavi(pyro.nn.PyroModule):
         self.training_steps_performed = 0
 
         # 1a) Define core parts of the model.
-        self.output_scale_factor = self.sample_scale_factor
+        self.output_scale_ctype_fx = self.sample_scale_ctype_fx
         self.output_global_base = self.sample_global_base
         self.output_scale_z = self.sample_scale_z
         self.output_topics = self.sample_topics
@@ -233,21 +250,11 @@ class Cellavi(pyro.nn.PyroModule):
             self.collect_batch_fx_i = self.compute_batch_fx_i
 
         if C == 1:
-            self.need_to_infer_cell_type = False
             self.output_ctype_fx = self.zero
             self.collect_ctype_fx_i = self.zero
-            self.output_c_indx = self.return_ctype_as_is
         else:
             self.output_ctype_fx = self.sample_ctype_fx
             self.collect_ctype_fx_i = self.compute_ctype_fx_i_no_enum
-            if ddata.cmask.all():
-                # All cell types are known.
-                self.need_to_infer_cell_type = False
-                self.output_c_indx = self.return_ctype_as_is
-            else:
-                # Some cell types are unknown.
-                self.need_to_infer_cell_type = True
-                self.output_c_indx = self.sample_c_indx
 
         # 2) Register frozen parameters.
         self.frozen = freeze
@@ -255,7 +262,7 @@ class Cellavi(pyro.nn.PyroModule):
         # 3) Instantiate autoguide.
         # Local variables must be hidden because they are defined in the guide.
         local_variables = ["log_theta_i", "ctype_i_unobserved", "z_i", "x_i"]
-        self.autonormal = AutoNormal(pyro.poutine.block(self.model, hide=local_variables))
+        self.autonormal = AutoNormal(pyro.poutine.block(self.model, hide=local_variables), init_loc_fn=self.init_loc_fn)
         # Instantiate parameters now. Note that redefining `self.autonormal`
         # will destroy the current parameters of the autoguide.
         # TODO: test if this is really useful (doing something).
@@ -273,7 +280,11 @@ class Cellavi(pyro.nn.PyroModule):
         else:
             self.amortizer = None
             self.log_theta_i_loc = pyro.nn.module.PyroParam(
-                torch.where(self.ddata.smask.unsqueeze(-1), self.ddata.stopic, torch.zeros_like(self.ddata.stopic)),
+                torch.where(
+                    self.ddata.smask.unsqueeze(-1),
+                    self.ddata.stopic,
+                    torch.zeros_like(self.ddata.stopic),
+                ),
                 event_dim=1,
             )
             self.log_theta_i_scale = pyro.nn.module.PyroParam(
@@ -294,19 +305,46 @@ class Cellavi(pyro.nn.PyroModule):
                 event_dim=0,
             )
 
-    def to(self, device):
-        self.flag = torch.zeros(1, requires_grad=False, device=device)
-
-    @property
-    def device(self):
-        return self.flag.device
+    def init_loc_fn(self, site):
+        if site["name"] == "scale_ctype_fx":
+            return 0.10 * torch.ones(1, C)
+        elif site["name"] == "scale_batch_fx":
+            return 0.01 * torch.ones(1, G)
 
     def replace_data(self, ddata):
         self.ddata = ddata
         self.bsz = len(ddata) if len(ddata) < SUBSMPL else SUBSMPL
 
-    def switch_on_amortization(self, delete_variational_params=True):
+    def train_amortizer(self):
+        # Use a simple training loop to optimize the amortizer.
+        optimizer = torch.optim.Adam(self.amortizer.parameters(), lr=0.01)
+        # Train for `N_BATCHES` batches.
+        for _ in range(N_BATCHES):
+            # Sample `SUBSMPL` cells at random.
+            idx_i = torch.randperm(len(self.ddata))[:SUBSMPL].sort().values
+            data_i = self.ddata[idx_i]
+            # Prepare targets (remove gradients from parameters).
+            targets_loc = self.log_theta_i_loc[idx_i].detach()
+            targets_scale = self.log_theta_i_scale[idx_i].detach()
+            # Prepare input data.
+            x_i = data_i.x
+            ohb_i = data_i.one_hot_batch
+            ohc_i = data_i.one_hot_ctype
+            ohg_i = data_i.one_hot_group
+            freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
+            bcgf_i = torch.cat([ohb_i, ohc_i, ohg_i, freq_i], dim=-1)
+
+            l2_loss = torch.nn.MSELoss()
+            optimizer.zero_grad()
+            loc, scale = self.amortizer(bcgf_i)
+            # Compute composite MSE loss.
+            loss = l2_loss(loc, targets_loc) + l2_loss(scale, targets_scale)
+            loss.backward()
+            optimizer.step()
+
+    def switch_on_amortization(self, delete_local_params=True):
         self.amortize = True
+        self.collapse = True
         self.amortizer = InferenceNetwork(
             # Make space for batch, cell type, and group.
             input_size=G + B + C + R,
@@ -314,9 +352,12 @@ class Cellavi(pyro.nn.PyroModule):
             output_size=K,
             dropout_rate=0.3,
         )
-        if delete_variational_params:
+        self.train_amortizer()
+        if delete_local_params:
             del self.log_theta_i_loc
             del self.log_theta_i_scale
+            del self.z_i_loc
+            del self.z_i_scale
 
     def freeze(self, param):
         self.frozen.add(param)
@@ -359,15 +400,25 @@ class Cellavi(pyro.nn.PyroModule):
         return 0.0
 
     #  ==  Model parts ==  #
-    def sample_scale_factor(self, device):
-        scale_factor = pyro.sample(
-            name="scale_factor",
-            # dim(scale_factor): (P x 1) x C
-            fn=dist.Exponential(
-                rate=torch.ones(1).to(device),
+    def sample_scale_ctype_fx(self, device):
+        scale_ctype_fx = pyro.sample(
+            name="scale_ctype_fx",
+            # dim(scale_ctype_fx): (P) x 1 x C
+            fn=dist.HalfNormal(
+                scale=0.3 * torch.ones(1, 1).to(device),
             ),
         )
-        return scale_factor
+        # dim(scale_ctype_fx): (P) x C x 1
+        scale_ctype_fx = scale_ctype_fx.transpose(-1, -2)
+        return scale_ctype_fx
+
+    def sample_scale_batch_fx(self, device):
+        scale_batch_fx = pyro.sample(
+            name="scale_batch_fx",
+            # dim(scale_batch_fx): (P) x 1 x G
+            fn=dist.HalfNormal(scale=0.07 * torch.ones(1, 1).to(device)),
+        )
+        return scale_batch_fx
 
     def sample_global_base(self, device):
         global_base = pyro.sample(
@@ -381,13 +432,13 @@ class Cellavi(pyro.nn.PyroModule):
         )
         return global_base
 
-    def sample_ctype_fx(self, scale_factor, device):
+    def sample_ctype_fx(self, scale_ctype_fx, device):
         ctype_fx = pyro.sample(
             name="ctype_fx",
             # dim(ctype_fx): (P) x C x G
             fn=dist.Normal(
                 torch.zeros(1, 1).to(device),
-                scale_factor,
+                scale_ctype_fx,
             ),
         )
         return ctype_fx
@@ -402,20 +453,12 @@ class Cellavi(pyro.nn.PyroModule):
         scale_z = scale_z.transpose(-1, -2)
         return scale_z
 
-    def sample_scale_batch_fx(self, device):
-        scale_batch_fx = pyro.sample(
-            name="scale_batch_fx",
-            # dim(scale_batch_fx): (P) x 1 x G
-            fn=dist.HalfNormal(0.01 * torch.ones(1, 1).to(device)),
-        )
-        return scale_batch_fx
-
     def sample_batch_fx(self, scale_batch_fx, device):
         batch_fx = pyro.sample(
             name="batch_fx",
             # dim(batch_fx): (P) x B x G
             fn=dist.Normal(
-                loc=0.00 * torch.zeros(1, 1).to(device),
+                loc=0.0 * torch.zeros(1, 1).to(device),
                 scale=scale_batch_fx,
             ),
         )
@@ -441,34 +484,18 @@ class Cellavi(pyro.nn.PyroModule):
         topics = topics_KR.view(topics_KR.shape[:-2] + (K, R, G))
         return topics
 
-    def sample_c_indx(self, ctype_i, ctype_i_mask, device):
-        sampled_ctype_i = pyro.sample(
-            name="ctype_i",
-            # dim(c_indx): C x (P) x 1 x ncells | C
-            fn=dist.OneHotCategorical(
-                torch.ones(1, 1, C).to(device),
-            ),
-            obs=ctype_i,
-            obs_mask=ctype_i_mask,
-            infer={"enumerate": "parallel"},
-        )
-        return sampled_ctype_i
-
-    def return_ctype_as_is(self, ctype_i, cmask_i_mask, device):
-        return ctype_i
-
-    def sample_theta_i(self, slabel_i, slabel_i_mask, device):
+    def sample_theta_i(self, stopic_i, stopic_i_mask, device):
         # Tweak the prior, depending on whether labels are specified.
         prior_loc = torch.where(
-            slabel_i_mask.unsqueeze(-1).expand(slabel_i.shape),
-            slabel_i,
-            0.0 * torch.zeros_like(slabel_i).to(device),
+            stopic_i_mask.unsqueeze(-1).expand(stopic_i.shape),
+            stopic_i,
+            0.0 * torch.zeros_like(stopic_i).to(device),
         ).unsqueeze(-3)
         prior_scale = torch.where(
-            slabel_i_mask.unsqueeze(-1).expand(slabel_i.shape),
+            stopic_i_mask.unsqueeze(-1).expand(stopic_i.shape),
             # Squeeze close to 99% for known labels.
-            0.1 * torch.ones_like(slabel_i).to(device),
-            1.0 * torch.ones_like(slabel_i).to(device),
+            0.1 * torch.ones_like(stopic_i).to(device),
+            1.0 * torch.ones_like(stopic_i).to(device),
         ).unsqueeze(-3)
         log_theta_i = pyro.sample(
             name="log_theta_i",
@@ -515,22 +542,9 @@ class Cellavi(pyro.nn.PyroModule):
         sg = sg.transpose(-1, -2)
         s2 = torch.square(sg)
 
-        if self.need_to_infer_cell_type is False or mu.dim() == 2:
-            avmu = mu
-        else:
-            self._pyro_context.active += 1
-            # dim(c_indx_probs): ncells x 1 x C
-            c_indx_probs = self.c_indx_probs.detach()
-            self._pyro_context.active -= 1
-            # dim(avmu): (P) x ncells x G
-            if c_indx_probs.dim() > 2:
-                avmu = torch.einsum("C...nG,onC->...nG", mu, c_indx_probs)
-            else:
-                avmu = torch.einsum("C...nG,nC->...nG", mu, c_indx_probs)
-
         # Remove gradient for Newton-Raphson cycles.
         # dim(mu_): ncells x G
-        mu_ = avmu[None].mean(dim=-3).detach()
+        mu_ = mu[None].mean(dim=-3).detach()
         # dim(s2_): ncells x G
         s2_ = 1.0 / (1.0 / s2[None].detach()).mean(dim=-3)
 
@@ -563,9 +577,9 @@ class Cellavi(pyro.nn.PyroModule):
         k2 = torch.clamp(s2_ / (s2_ * x_ij + 1 - nu), max=32)
 
         # Scale estimates over training steps.
-        t = 1.0 - math.exp(-2 * (3 * self.training_steps_performed / MIN_NUM_GLOBAL_UPDATES) ** 2)
-        nu = t * nu
-        k2 = t * k2
+        # t = 1.0 - math.exp(-2 * (3 * self.training_steps_performed / MIN_NUM_GLOBAL_UPDATES) ** 2)
+        # nu = t * nu
+        # k2 = t * k2
 
         # Put a cap on `nu` and `k2` for numeric stability.
         nu = torch.clamp(nu, min=min_nu, max=max_nu)
@@ -578,16 +592,17 @@ class Cellavi(pyro.nn.PyroModule):
     def model(self, ddata_i=None):
         device = ddata_i.x.device
 
-        with pyro.plate("C", C, dim=-2):
-            # The parameter `scale_factor` describes the standard
+        with pyro.plate("C", C, dim=-1):
+            # The parameter `scale_ctype_fx` describes the standard
             # deviations for every cell type from the global
-            # baseline. The prior is exponential, with 90% weight
-            # in the interval (0.05, 3.00). The standard deviation
-            # is applied to all the genes so it describes how far
-            # the cell type is from the global baseline.
+            # baseline. The prior is half-normal, with 90% weight
+            # below 0.5 (allowing a 4.5-fold variation over the
+            # baseline). The standard deviation is applied to all
+            # the genes so it describes how far the cell type is
+            # from the global baseline.
 
-            # dim(scale_factor): (P) x C x 1
-            scale_factor = self.output_scale_factor(device)
+            # dim(scale_ctype_fx): (P) x C x 1
+            scale_ctype_fx = self.output_scale_ctype_fx(device)
 
         # Per-gene sampling.
         with pyro.plate("G", G, dim=-1):
@@ -612,7 +627,7 @@ class Cellavi(pyro.nn.PyroModule):
             # above 1.15, meaning that 1% of the genes are expected
             # to vary by a factor 30, everything held constant.
 
-            # dim(scale_z): (P) x G x 1
+            # dim(scale_z): (P) x 1 x G
             scale_z = self.output_scale_z(device)
 
             # ...
@@ -623,10 +638,10 @@ class Cellavi(pyro.nn.PyroModule):
             with pyro.plate("CxG", C, dim=-2):
                 # The cell type effects have a Gaussian distribution
                 # centered on 0. The dispersion is set by the hyper-
-                # parameter `scale_factor`.
+                # parameter `scale_ctype_fx`.
 
                 # dim(base): (P) x C x G
-                ctype_fx = self.output_ctype_fx(scale_factor, device)
+                ctype_fx = self.output_ctype_fx(scale_ctype_fx, device)
 
             # Per-batch, per-gene sampling.
             with pyro.plate("BxG", B, dim=-2):
@@ -654,12 +669,8 @@ class Cellavi(pyro.nn.PyroModule):
             one_hot_ctype_i = ddata_i.one_hot_ctype
             one_hot_batch_i = ddata_i.one_hot_batch
             one_hot_group_i = ddata_i.one_hot_group
-            ctype_i_mask = ddata_i.cmask
-            slabel_i = ddata_i.stopic
-            slabel_i_mask = ddata_i.smask
-
-            # dim(c_indx): C x (P) x 1 x ncells
-            one_hot_c_indx = self.output_c_indx(one_hot_ctype_i, ctype_i_mask, device)
+            stopic_i = ddata_i.stopic
+            stopic_i_mask = ddata_i.smask
 
             # Proportion of each topic in transcriptomes.
             # The proportions are computed from the softmax
@@ -668,12 +679,12 @@ class Cellavi(pyro.nn.PyroModule):
             # are within a factor 10 of each other.
 
             # dim(theta_i): (P) x ncells x 1 x K
-            theta_i = self.output_theta_i(slabel_i, slabel_i_mask, device)
+            theta_i = self.output_theta_i(stopic_i, stopic_i_mask, device)
 
             # Deterministic functions to collect per-cell means.
 
             # dim(ctype_fx_i): C x (P) x ncells x G
-            ctype_fx_i = self.collect_ctype_fx_i(ctype_fx, one_hot_c_indx)
+            ctype_fx_i = self.collect_ctype_fx_i(ctype_fx, one_hot_ctype_i)
 
             # dim(batch_fx_i): (P) x ncells x G
             batch_fx_i = self.collect_batch_fx_i(batch_fx, one_hot_batch_i)
@@ -766,9 +777,6 @@ class Cellavi(pyro.nn.PyroModule):
             self._pyro_context.active += 1
             x_i = ddata_i.x
 
-            # Subset data and mask.
-            ctype_i_mask = ddata_i.cmask
-
             # Get topic-breakdown parameters by either calling the amortizer
             # on the input data or by pulling learnable parameters.
             if self.amortize is True:
@@ -801,18 +809,6 @@ class Cellavi(pyro.nn.PyroModule):
                             loc=self.z_i_loc,
                             scale=self.z_i_scale,
                         ),
-                    )
-
-            # If some cell types are unknown, sample them here.
-            if self.need_to_infer_cell_type:
-                with pyro.poutine.mask(mask=~ctype_i_mask):
-                    pyro.sample(
-                        name="ctype_i_unobserved",
-                        # dim(c_indx): C x 1 x 1 x 1 | C
-                        fn=dist.OneHotCategorical(
-                            self.c_indx_probs,
-                        ),
-                        infer={"enumerate": "parallel"},
                     )
 
             self._pyro_context.active -= 1
