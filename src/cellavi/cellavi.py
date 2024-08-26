@@ -136,9 +136,9 @@ class plTrainHarness(pl.LightningModule):
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         for key, value in batch.__dict__.items():
-            if key == "idx_i":
-                continue
-            if isinstance(value, torch.Tensor):
+            # All tensors are moved to the device, except `idx_i`, which
+            # is an integer tensor that is used to subsample the data.
+            if isinstance(value, torch.Tensor) and key != "idx_i":
                 batch.__dict__[key] = value.to(self.device)
         return batch
 
@@ -221,6 +221,9 @@ class Cellavi(pyro.nn.PyroModule):
         freeze=set(),
     ):
         super().__init__()
+
+        # Dummy parameter for automatic device and dtype placement.
+        self.flag = torch.nn.Linear(1, 1, bias=False)
 
         self.ddata = ddata
         self.PoE = PoE
@@ -305,6 +308,14 @@ class Cellavi(pyro.nn.PyroModule):
                 event_dim=0,
             )
 
+    @property
+    def device(self):
+        return self.flag.weight.device
+
+    @property
+    def dtype(self):
+        return self.flag.weight.dtype
+
     def init_loc_fn(self, site):
         if site["name"] == "scale_ctype_fx":
             return 0.10 * torch.ones(1, C)
@@ -323,9 +334,6 @@ class Cellavi(pyro.nn.PyroModule):
             # Sample `SUBSMPL` cells at random.
             idx_i = torch.randperm(len(self.ddata))[:SUBSMPL].sort().values
             data_i = self.ddata[idx_i]
-            # Prepare targets (remove gradients from parameters).
-            targets_loc = self.log_theta_i_loc[idx_i].detach()
-            targets_scale = self.log_theta_i_scale[idx_i].detach()
             # Prepare input data.
             x_i = data_i.x
             ohb_i = data_i.one_hot_batch
@@ -333,6 +341,9 @@ class Cellavi(pyro.nn.PyroModule):
             ohg_i = data_i.one_hot_group
             freq_i = x_i / x_i.sum(dim=-1, keepdim=True)
             bcgf_i = torch.cat([ohb_i, ohc_i, ohg_i, freq_i], dim=-1)
+            # Prepare targets (remove gradients from parameters).
+            targets_loc = self.log_theta_i_loc[idx_i].detach().to(bcgf_i)
+            targets_scale = self.log_theta_i_scale[idx_i].detach().to(bcgf_i)
 
             l2_loss = torch.nn.MSELoss()
             optimizer.zero_grad()

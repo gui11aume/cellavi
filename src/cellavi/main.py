@@ -16,7 +16,6 @@ SUBSMPL = 512
 
 # Suppress the specific warning about the number of workers.
 warnings.filterwarnings("ignore", message=".*does not have many workers which may be a bottleneck.*")
-warnings.filterwarnings("ignore", message=".*The epoch parameter in `scheduler.step()` was not necessary.*")
 
 
 class CustomProgressBar(Callback):
@@ -46,6 +45,12 @@ class CustomProgressBar(Callback):
 
 
 def main():
+    # Initialize everything as soon as main starts.
+    pl.seed_everything(123)
+    torch.set_default_dtype(torch.float32)
+    torch.set_float32_matmul_precision("high")
+    pyro.clear_param_store()
+
     parser = argparse.ArgumentParser(description="Cellavi")
     parser.add_argument("-K", type=int, default=1, help="number of topics (default: 1)")
     parser.add_argument("-C", type=int, default=0, help="number of cell types (default: auto)")
@@ -59,10 +64,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    pyro.clear_param_store()
-    torch.set_default_dtype(torch.float32)
-    torch.set_float32_matmul_precision("high")
 
     meta_path = args.meta_path
     data_path = args.data_path
@@ -128,6 +129,7 @@ def main():
         R=cellavi.R,
     )
 
+    # TODO: find better names for the data variables.
     sdata = ddata.subsample_to(8192)
 
     model = Cellavi(ddata=sdata, PoE=PoE, amortize=False, collapse=False)
@@ -140,7 +142,23 @@ def main():
         model.freeze("global_base")
         model.freeze("topics_KR")
 
-    # The train data loaders are dummy lists of indices and the
+    harnessed = plTrainHarness(model)
+
+    trainer_args = {
+        "default_root_dir": ".",
+        "accelerator": "gpu",
+        "gradient_clip_val": 1.0,
+        "enable_progress_bar": False,
+        "enable_model_summary": False,
+        "logger": pl.loggers.CSVLogger("."),
+        "log_every_n_steps": 1,
+        "enable_checkpointing": False,
+        "callbacks": [CustomProgressBar()],
+    }
+
+    # Phase 1. ===============================================
+
+    # The train data loader is a dummy list of indices and the
     # collators return the corresponding rows of the data.
     # This is required because Pyro needs to know how to subset
     # the corresponding parameters.
@@ -150,13 +168,31 @@ def main():
         batch_size=cellavi.SUBSMPL,
         collate_fn=CellaviCollator(sdata),
     )
+    phase_1_trainer = pl.Trainer(
+        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
+        max_epochs=harnessed.compute_num_training_epochs(),
+        **trainer_args,
+    )
+    phase_1_trainer.fit(harnessed, phase_1_data_loader)
 
+    # Phase 2. ===============================================
+
+    # The train data loaders is the same as above, except that
+    # we now use the full dataset.
     phase_2_data_loader = torch.utils.data.DataLoader(
         dataset=torch.arange(len(ddata)),
         shuffle=True,
         batch_size=cellavi.SUBSMPL,
         collate_fn=CellaviCollator(ddata),
     )
+    model.switch_on_amortization()
+    model.replace_data(ddata)
+    phase_2_trainer = pl.Trainer(
+        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
+        max_epochs=harnessed.compute_num_training_epochs(),
+        **trainer_args,
+    )
+    phase_2_trainer.fit(harnessed, phase_2_data_loader)
 
     # The test data loader is the same dummy list of indices
     # but shuffling is turned off so that cells are processed in
@@ -169,39 +205,7 @@ def main():
         batch_size=64 * cellavi.SUBSMPL,
         collate_fn=CellaviCollator(ddata),
     )
-
-    harnessed = plTrainHarness(model)
-
-    trainer_args = {
-        "default_root_dir": ".",
-        "accelerator": "gpu",
-        "gradient_clip_val": 1.0,
-        "max_epochs": harnessed.compute_num_training_epochs(),
-        "enable_progress_bar": False,
-        "enable_model_summary": False,
-        "logger": pl.loggers.CSVLogger("."),
-        "log_every_n_steps": 1,
-        "enable_checkpointing": False,
-        "callbacks": [CustomProgressBar()],
-    }
-
-    trainer_phase_1 = pl.Trainer(
-        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
-        **trainer_args,
-    )
-    trainer_phase_2 = pl.Trainer(
-        strategy=pl.strategies.DeepSpeedStrategy(stage=2),
-        **trainer_args,
-    )
-
-    pl.seed_everything(123)
-    # Phase 1.
-    trainer_phase_1.fit(harnessed, phase_1_data_loader)
-    # Phase 2.
-    model.switch_on_amortization()
-    model.replace_data(ddata)
-    trainer_phase_2.fit(harnessed, phase_2_data_loader)
-    trainer_phase_2.test(harnessed, test_data_loader)
+    phase_2_trainer.test(harnessed, test_data_loader)
 
     # Save output to file.
     param_store = pyro.get_param_store().get_state()
